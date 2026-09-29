@@ -30,8 +30,8 @@ sub plugin_info {
         type        => "metadata",
         namespace   => "etagcn",
         login_from  => "ehlogin",
-        author      => "GrayZhao & Difegue and FreeJohn",
-        version     => "2.6.3",
+        author      => "FreeJohn&DeepSeek",
+        version     => "2.6.4",
         description =>
           "搜索 g.e-hentai 以查找与您的存档匹配的标签,并将原标签翻译为中文标签. <br/><i class='fa fa-exclamation-circle'></i> 此插件将使用存档的 source: tag （如果存在）",
         icon =>
@@ -46,7 +46,7 @@ sub plugin_info {
                 desc => "该功能请先启用“使用搜刮到的标题”。若开启，漫画标题会使用搜刮到的日文标题；若关闭，则使用英文或罗马拼音标题"
             },
             { type => "bool", desc => "获取额外的时间戳（发布时间）和上传者元数据" },
-            { type => "bool", desc => "仅搜索已删除的画廊" },
+            { type => "bool", desc => "搜索已删除的画廊" },
             { type => "string", desc => "EhTagTranslation项目的JSON数据库文件(db.text.json)的绝对路径" },
             { type => "bool", desc => "自动更新标签数据库（从 EhTagTranslation releases 下载最新 db.text.json，需联网）" },
             { type => "int",  desc => "标签数据库更新检查间隔（天），默认 1；填 0 表示每次都检查" },
@@ -444,6 +444,41 @@ sub db_target_path ($db_path) {
     return $first;
 }
 
+# 插件自身的“上次检查标签库更新”时间戳文件。
+# 用单独的时间戳而不是 db 文件 mtime：这样即使远端没有变化、db 文件没被改写，
+# 也能正确节流，不会“超过一天后每次请求都去检查一次”。
+sub db_check_marker_path ($target) {
+    my $marker = "$target.lastcheck";
+
+    # 优先放在 db 同目录（通常可写）；目录不可写时退回系统临时目录
+    ( my $dir = $marker ) =~ s{[\\/][^\\/]+$}{};
+    return $marker if $dir ne '' && -w $dir;
+
+    require File::Spec;
+    ( my $key = $target ) =~ s{\W}{_}g;
+    return File::Spec->catfile( File::Spec->tmpdir, "etagcn_lastcheck_$key" );
+}
+
+sub read_last_check ($marker) {
+    return 0 unless defined $marker && $marker ne '' && -f $marker;
+    open( my $fh, '<', $marker ) or return 0;
+    my $t = <$fh>;
+    close $fh;
+    return 0 unless defined $t;
+    $t =~ s/\s+//g;
+    return ( $t =~ /^\d+$/ ) ? $t : 0;
+}
+
+sub write_last_check ($marker) {
+    return unless defined $marker && $marker ne '';
+    open( my $fh, '>', $marker ) or do {
+        get_plugin_logger()->warn("无法写入标签库更新检查时间戳 $marker: $!");
+        return;
+    };
+    print $fh time();
+    close $fh;
+}
+
 # 解析标签数据库路径：优先用插件参数，失败则回退到常见位置
 sub resolve_db_path ($db_path) {
     my @candidates;
@@ -481,15 +516,21 @@ sub update_db_if_needed ( $ua, $db_path, $days ) {
     my $target = db_target_path($db_path);
     return unless defined $target && $target ne '';
 
-    $logger->debug("Tag DB target: $target (interval=${days}d)");
+    my $marker = db_check_marker_path($target);
+    $logger->debug("Tag DB target: $target, check marker: $marker (interval=${days}d)");
 
-    # 频率限制：距离上次更新不足 $days 天则跳过（$days==0 表示每次都检查）
-    if ( $days > 0 && -f $target ) {
-        my $age   = time() - ( stat($target) )[9];
+    # 频率限制：距离插件“上次检查”不足 $days 天则跳过（$days==0 表示每次都检查）。
+    # 用插件自己的时间戳节流，而不是 db 文件的 mtime，避免远端无变化时被反复检查。
+    # 首次（还没有时间戳）时退回用 db 文件 mtime 作基线。
+    my $last_check = read_last_check($marker);
+    $last_check = ( stat($target) )[9] || 0 if !$last_check && -f $target;
+
+    if ( $days > 0 && $last_check ) {
+        my $age   = time() - $last_check;
         my $limit = $days * 86400;
         if ( $age < $limit ) {
             my $left_h = int( ( $limit - $age ) / 3600 );
-            $logger->info("Tag DB is fresh (updated ${age}s ago); next update check in ~${left_h}h. "
+            $logger->info("Tag DB check skipped (last checked ${age}s ago); next check in ~${left_h}h. "
                   . "Set the interval to 0 to force a check now." );
             return;
         }
@@ -519,7 +560,7 @@ sub update_db_if_needed ( $ua, $db_path, $days ) {
     # 优先用 API 的 sha256 摘要判断，无需下载
     if ( $remote_dig =~ /^sha256:([0-9a-f]{64})$/i && $local_sha ne '' && lc($1) eq lc($local_sha) ) {
         $logger->info("Tag DB already up to date (sha256 match), skip download");
-        utime( time(), time(), $target );
+        write_last_check($marker);
         return;
     }
 
@@ -543,7 +584,7 @@ sub update_db_if_needed ( $ua, $db_path, $days ) {
     if ( $local_md5 ne '' && $new_md5 ne '' && $new_md5 eq $local_md5 ) {
         unlink $tmp;
         $logger->info("Tag DB unchanged (md5=$new_md5), skip replace");
-        utime( time(), time(), $target );
+        write_last_check($marker);
         return;
     }
 
@@ -570,6 +611,7 @@ sub update_db_if_needed ( $ua, $db_path, $days ) {
     }
 
     $logger->info( "Tag DB updated: " . ( $local_md5 ne '' ? $local_md5 : '(none)' ) . " -> " . ( $new_md5 // '' ) );
+    write_last_check($marker);
 }
 
 # 将原tag翻译为中文tag
