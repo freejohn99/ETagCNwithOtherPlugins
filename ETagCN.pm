@@ -28,8 +28,8 @@ sub plugin_info {
         type        => "metadata",
         namespace   => "etagcn",
         login_from  => "ehlogin",
-        author      => "GrayZhao & Difegue and others",
-        version     => "2.6",
+        author      => "GrayZhao & Difegue and FreeJohn",
+        version     => "2.6.1",
         description =>
           "搜索 g.e-hentai 以查找与您的存档匹配的标签,并将原标签翻译为中文标签. <br/><i class='fa fa-exclamation-circle'></i> 此插件将使用存档的 source: tag （如果存在）",
         icon =>
@@ -107,7 +107,7 @@ sub get_tags {
         $logger->info($message);
         die "${message_cn}\n";
     } else {
-        $logger->debug("EH API Tokens are $gID / $gToken");
+        $logger->info("Using gallery $gID / $gToken");
     }
 
     my ( $ehtags, $ehtitle ) = &get_tags_from_EH( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path );
@@ -127,6 +127,27 @@ sub get_tags {
 ######
 ## EH Specific Methods
 ######
+
+# extract_gid_from_title(title)
+# Tries to pull the E-H gallery id out of an archive title.
+# Handles the common layouts used by EH downloaders/scrapers:
+#   "4210316-[artist] title"      -> leading id followed by a dash
+#   "[4210316] title"             -> id wrapped in square brackets
+#   "title (4210316)"             -> id wrapped in parentheses
+sub extract_gid_from_title ($title) {
+
+    # Leading gallery id, e.g. "4210316-[artist] title"
+    if ( $title =~ /^\s*(\d{4,})\s*-/ ) {
+        return $1;
+    }
+
+    # Bracketed ids anywhere in the title
+    if ( $title =~ /(?:\[|\()\s*(\d{4,})\s*(?:\]|\))/ ) {
+        return $1;
+    }
+
+    return "";
+}
 
 sub lookup_gallery ( $title, $tags, $thumbhash, $ua, $domain, $defaultlanguage, $usethumbs, $search_gid, $expunged ) {
 
@@ -148,24 +169,34 @@ sub lookup_gallery ( $title, $tags, $thumbhash, $ua, $domain, $defaultlanguage, 
         if ( $gId ne "" && $gToken ne "" ) {
             return ( $gId, $gToken );
         }
+        $logger->info("Thumbnail search returned no match, trying next method");
     }
 
     # Search using gID if present in title name
-    my ($title_gid) = $title =~ /\[([0-9]+)\]/g;
+    # Supported formats: "4210316-[artist] title", "[4210316] title", "title (4210316)"
+    my $title_gid = extract_gid_from_title($title);
+    if ( $search_gid && !$title_gid ) {
+        $logger->info("gID search is enabled but no gID could be parsed from title: '$title'");
+    }
     if ( $search_gid && $title_gid ) {
         $URL = $domain . "?f_search=" . uri_escape_utf8("gid:$title_gid");
 
-        $logger->debug("Found gID: $title_gid, Using URL $URL (gID from archive title)");
+        $logger->info("gID search: gid=$title_gid, URL=$URL");
 
         my ( $gId, $gToken ) = &ehentai_parse( $URL, $ua );
 
         if ( $gId ne "" && $gToken ne "" ) {
             return ( $gId, $gToken );
         }
+        $logger->info("gID search (gid=$title_gid) returned no match, falling back to title search");
     }
 
+    # Strip a leading gallery id (e.g. "4210316-[artist] title") so it does not pollute the text search
+    my $search_title = $title;
+    $search_title =~ s/^\s*\d{4,}\s*-\s*//;
+
     # Regular text search (advanced options: Disable default filters for: Language, Uploader, Tags)
-    $URL = $domain . "?advsearch=1&f_sfu=on&f_sft=on&f_sfl=on" . "&f_search=" . uri_escape_utf8( qw(") . $title . qw(") );
+    $URL = $domain . "?advsearch=1&f_sfu=on&f_sft=on&f_sfl=on" . "&f_search=" . uri_escape_utf8( qw(") . $search_title . qw(") );
 
     my $has_artist = 0;
 
@@ -188,31 +219,32 @@ sub lookup_gallery ( $title, $tags, $thumbhash, $ua, $domain, $defaultlanguage, 
         $URL = $URL . "&f_sh=on";
     }
 
-    $logger->debug("Using URL $URL (archive title)");
-    return &ehentai_parse( $URL, $ua );
+    $logger->info("Title search: URL=$URL");
+    my ( $gId, $gToken ) = &ehentai_parse( $URL, $ua );
+    $logger->info("Title search returned no match") if $gId eq "";
+    return ( $gId, $gToken );
 }
 
 # ehentai_parse(URL, UA)
 # Performs a remote search on e- or exhentai, and returns the ID/token matching the found gallery.
+# 注意：搜索无结果时不再直接 die，而是返回空串并记录诊断日志，让上层继续尝试其它搜索方式。
 sub ehentai_parse ( $url, $ua ) {
 
     my $logger = get_plugin_logger();
-    my $dom    = search_gallery( $url, $ua );
 
-    # Get the first row of the search results
-    # The "glink" class is parented by a <a> tag containing the gallery link in href.
-    # This works in Minimal, Minimal+ and Compact modes, which should be enough.
-    my $glink_element = $dom->at(".glink");
-    if (!$glink_element) {
-        $logger->debug("No gallery found in search results");
-        die "在搜索结果中未找到画廊。\n";
-        return ("", "");
+    my ( $dom, $err ) = search_gallery( $url, $ua );
+    if ( !$dom ) {
+        $logger->info("Search failed ($url): $err");
+        return ( "", "" );
     }
-    my $firstgal = $glink_element->parent->attr('href');
 
-    # A EH link looks like xhentai.org/g/{gallery id}/{gallery token}
-    $url = ( split( 'hentai.org/g/', $firstgal ) )[1];
-    my ( $gID, $gToken ) = ( split( '/', $url ) );
+    my ( $gID, $gToken, $how ) = extract_gallery_from_dom($dom);
+    if ( !$gID ) {
+        $logger->info( "No gallery in search results ($url): " . diagnose_search_page($dom) );
+        return ( "", "" );
+    }
+
+    $logger->info("Matched gallery $gID / $gToken (via $how)");
 
     if ( index( $dom->to_string, "You are opening" ) != -1 ) {
         my $rand = 15 + int( rand( 51 - 15 ) );
@@ -224,24 +256,92 @@ sub ehentai_parse ( $url, $ua ) {
     return ( $gID, $gToken );
 }
 
+# extract_gallery_from_dom(dom)
+# 取搜索结果里第一个画廊，返回 (gid, token, 匹配方式)。
+# 兼容两种布局：
+#   布局A（访客/冷会话）: .glink 的父级是 <a href=".../g/ID/TOKEN/">
+#   布局B（登录后 gl4e/glname）: .glink 只是纯文本 div，真正的 <a href> 在行内其它位置
+sub extract_gallery_from_dom ($dom) {
+
+    # 1) .glink 自身或其父级 <a>
+    for my $el ( @{ $dom->find('.glink') } ) {
+        for my $node ( $el, $el->parent ) {
+            next unless $node;
+            my $href = $node->attr('href') // '';
+            if ( $href =~ m{hentai\.org/g/(\d+)/([0-9a-z]+)}i ) {
+                return ( $1, $2, 'glink' );
+            }
+        }
+    }
+
+    # 2) 兜底：页面上第一个指向画廊的 <a>
+    for my $a ( @{ $dom->find('a') } ) {
+        my $href = $a->attr('href') // '';
+        if ( $href =~ m{hentai\.org/g/(\d+)/([0-9a-z]+)}i ) {
+            return ( $1, $2, 'anchor' );
+        }
+    }
+
+    return ();
+}
+
+# diagnose_search_page(dom)
+# 汇总一个“没找到画廊”页面的关键信息，便于定位真正的失败原因。
+sub diagnose_search_page ($dom) {
+
+    my $html  = $dom->to_string;
+    my $title = $dom->at('title') ? $dom->at('title')->text : '';
+    $title =~ s/[^\x20-\x7e]/./g;
+
+    my @notes;
+    push @notes, "title='$title'";
+    push @notes, ".glink=" . scalar( @{ $dom->find('.glink') } );
+    push @notes, "gallery_links="
+      . scalar( grep { ( $_->attr('href') // '' ) =~ m{hentai\.org/g/\d+/[0-9a-z]+}i } @{ $dom->find('a') } );
+
+    push @notes, "SadPanda"          if $html =~ /Sad Panda|sadpanda/i;
+    push @notes, "login_page"        if $html =~ /name="ipb_pass_hash"|act=Login/i;
+    push @notes, "ip_banned"         if $html =~ /Your IP address has been/i;
+    push @notes, "offensive_warning" if $html =~ /You are opening/i;
+    push @notes, "no_results"        if $html =~ /No hits found|No results|not found/i;
+
+    my $text = $html;
+    $text =~ s/<[^>]*>/ /g;
+    $text =~ s/\s+/ /g;
+    $text =~ s/[^\x20-\x7e]/./g;    # 只保留 ASCII，避免日志乱码
+    push @notes, "text='" . substr( $text, 0, 160 ) . "'";
+
+    return join( '; ', @notes );
+}
+
 sub search_gallery ( $url, $ua ) {
 
     my $logger = get_plugin_logger();
 
-    my $res = $ua->max_redirects(5)->get($url)->result;
-    
-    # 添加判断，检查$res->body是否为空
-    if ($res->body eq '') {
+    my $tx  = $ua->max_redirects(5)->get($url);
+    my $res = $tx->result;
+
+    if ( !$res || !$res->is_success ) {
+        my $msg  = $tx->error ? $tx->error->{message} : 'unknown error';
+        my $code = $res ? $res->code : '-';
+        $logger->info("GET $url -> HTTP $code ($msg)");
+        return ( undef, "HTTP 请求失败: $msg" );
+    }
+
+    my $body = $res->body;
+    $logger->info( "GET $url -> HTTP " . $res->code . ", " . length($body) . " bytes" );
+
+    if ( $body eq '' ) {
         $logger->info("The `igneous cookie` parameter of the login plugin `E-Hentai` may have expired, please update it in time!");
-        die "登录插件 `E-Hentai`的`igneous cookie`参数可能已过期，请及时更新！\n";
+        return ( undef, "响应为空：登录插件 `E-Hentai` 的 `igneous cookie` 可能已过期" );
     }
 
-    if ( index( $res->body, "Your IP address has been" ) != -1 ) {
+    if ( index( $body, "Your IP address has been" ) != -1 ) {
         $logger->info("Temporarily banned from EH for excessive pageloads.");
-        die "因页面加载过多，您的 IP 地址已被 E-Hentai 暂时封禁。\n";
+        return ( undef, "IP 被 E-Hentai 暂时封禁（页面加载过多）" );
     }
 
-    return $res->dom;
+    return ( $res->dom, undef );
 }
 
 # get_tags_from_EH(userAgent, gID, gToken, jpntitle, additionaltags)
@@ -263,6 +363,7 @@ sub get_tags_from_EH ( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path 
     my $ehcat = lc @$data[0]->{"category"};
     $ehcat =~ s/\s+//g;
 
+    push( @tags, "gid:$gID" );
     push( @tags, "reclass:$ehcat" );
     if ($additionaltags) {
         my $ehuploader  = @$data[0]->{"uploader"};
@@ -310,17 +411,51 @@ sub get_json_from_EH ( $ua, $gID, $gToken ) {
     return $jsonresponse;
 }
 
+# 解析标签数据库路径：优先用插件参数，失败则回退到常见位置
+sub resolve_db_path ($db_path) {
+    my @candidates;
+    push @candidates, $db_path if defined $db_path && $db_path ne '';
+    push @candidates, (
+        '/home/koyomi/lanraragi/database/db.text.json',
+        ( $ENV{LRR_DATA_DIR} ? "$ENV{LRR_DATA_DIR}/db.text.json" : () ),
+        './db.text.json',
+    );
+    for my $f (@candidates) {
+        next if !defined $f || $f eq '';
+        return $f if -f $f;
+    }
+    return undef;
+}
+
 # 将原tag翻译为中文tag
 sub translate_tag_to_cn ( $list, $db_path ) {
+
     my $logger = get_plugin_logger();
-    my $filename = $db_path; # json 文件的路径
-    my $json_text = do {
-        open(my $json_fh, "<", $filename)
-            or $logger->debug("Can't open $filename: $!\n");
-        local $/;
-        <$json_fh>;
-    };
-    my $json = decode_json($json_text);
+
+    my $filename = resolve_db_path($db_path);
+    if ( !$filename ) {
+        $logger->error(
+            "找不到 EhTagTranslation 标签数据库 db.text.json（插件参数路径: '"
+              . ( $db_path // '' )
+              . "'）。将返回未翻译的原始标签；请把 db.text.json 放入容器并修正参数路径。"
+        );
+        return $list;
+    }
+    $logger->info("Using tag database: $filename");
+
+    open( my $json_fh, '<', $filename )
+      or do {
+        $logger->error("无法打开标签数据库 $filename: $!；将返回未翻译的原始标签。");
+        return $list;
+      };
+    my $json_text = do { local $/; <$json_fh> };
+    close $json_fh;
+
+    my $json = eval { decode_json($json_text) };
+    if ( !$json || ref $json->{data} ne 'ARRAY' ) {
+        $logger->error("标签数据库解析失败（不是有效的 EhTagTranslation db.text.json？）: $filename；将返回未翻译的原始标签。");
+        return $list;
+    }
     my $target = $json->{'data'};
 
     for my $item (@$list) {
