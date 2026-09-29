@@ -14,6 +14,8 @@ use URI::Escape;
 use Mojo::JSON qw(decode_json encode_json);
 use Mojo::Util qw(html_unescape);
 use Mojo::UserAgent;
+use Digest::MD5;
+use Digest::SHA;
 
 #You can also use the LRR Internal API when fitting.
 use LANraragi::Model::Plugins;
@@ -29,7 +31,7 @@ sub plugin_info {
         namespace   => "etagcn",
         login_from  => "ehlogin",
         author      => "GrayZhao & Difegue and FreeJohn",
-        version     => "2.6.1",
+        version     => "2.6.3",
         description =>
           "搜索 g.e-hentai 以查找与您的存档匹配的标签,并将原标签翻译为中文标签. <br/><i class='fa fa-exclamation-circle'></i> 此插件将使用存档的 source: tag （如果存在）",
         icon =>
@@ -46,6 +48,8 @@ sub plugin_info {
             { type => "bool", desc => "获取额外的时间戳（发布时间）和上传者元数据" },
             { type => "bool", desc => "仅搜索已删除的画廊" },
             { type => "string", desc => "EhTagTranslation项目的JSON数据库文件(db.text.json)的绝对路径" },
+            { type => "bool", desc => "自动更新标签数据库（从 EhTagTranslation releases 下载最新 db.text.json，需联网）" },
+            { type => "int",  desc => "标签数据库更新检查间隔（天），默认 1；填 0 表示每次都检查" },
         ],
         oneshot_arg => "该漫画在e-hentai的URL(将于确切的漫画相匹配的标签到你的档案中)",
         cooldown    => 4
@@ -61,7 +65,10 @@ sub get_tags {
     shift;
     my $lrr_info = shift;                                                                               # Global info hash
     my $ua       = $lrr_info->{user_agent};
-    my ( $lang, $savetitle, $usethumbs, $search_gid, $enablepanda, $jpntitle, $additionaltags, $expunged, $db_path ) = @_;    # Plugin parameters
+    my ( $lang, $savetitle, $usethumbs, $search_gid, $enablepanda, $jpntitle, $additionaltags, $expunged, $db_path,
+        $autoupdate_db, $db_update_days ) = @_;    # Plugin parameters
+
+    $db_update_days = 1 if !defined $db_update_days || $db_update_days !~ /^\d+$/;
 
     # Use the logger to output status - they'll be passed to a specialized logfile and written to STDOUT.
     my $logger = get_plugin_logger();
@@ -110,7 +117,7 @@ sub get_tags {
         $logger->info("Using gallery $gID / $gToken");
     }
 
-    my ( $ehtags, $ehtitle ) = &get_tags_from_EH( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path );
+    my ( $ehtags, $ehtitle ) = &get_tags_from_EH( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path, $autoupdate_db, $db_update_days );
     my %hashdata = ( tags => $ehtags );
 
     # Add source URL and title if possible/applicable
@@ -344,13 +351,23 @@ sub search_gallery ( $url, $ua ) {
     return ( $res->dom, undef );
 }
 
-# get_tags_from_EH(userAgent, gID, gToken, jpntitle, additionaltags)
+# get_tags_from_EH(userAgent, gID, gToken, jpntitle, additionaltags, db_path, autoupdate_db, db_update_days)
 # Executes an e-hentai API request with the given JSON and returns tags and title.
-sub get_tags_from_EH ( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path ) {
+sub get_tags_from_EH ( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path, $autoupdate_db, $db_update_days ) {
 
     my $uri = 'https://api.e-hentai.org/api.php';
 
     my $logger = get_plugin_logger();
+
+    # 按需自动更新标签数据库（失败不影响本次抓取，继续用现有数据库）
+    if ($autoupdate_db) {
+        $logger->info( "Tag DB auto-update enabled (check interval: " . ( $db_update_days // 1 ) . " day(s))" );
+        eval { update_db_if_needed( $ua, $db_path, $db_update_days ); 1 }
+          or $logger->error( "自动更新标签数据库失败: " . ( $@ // 'unknown' ) );
+    }
+    else {
+        $logger->info("Tag DB auto-update disabled (enable it in plugin settings to fetch updates)");
+    }
 
     my $jsonresponse = get_json_from_EH( $ua, $gID, $gToken );
 
@@ -411,20 +428,148 @@ sub get_json_from_EH ( $ua, $gID, $gToken ) {
     return $jsonresponse;
 }
 
-# 解析标签数据库路径：优先用插件参数，失败则回退到常见位置
-sub resolve_db_path ($db_path) {
-    my @candidates;
-    push @candidates, $db_path if defined $db_path && $db_path ne '';
-    push @candidates, (
+# 标签数据库的常见默认位置（用于回退与自动下载目标）
+sub default_db_paths {
+    return (
         '/home/koyomi/lanraragi/database/db.text.json',
         ( $ENV{LRR_DATA_DIR} ? "$ENV{LRR_DATA_DIR}/db.text.json" : () ),
         './db.text.json',
     );
+}
+
+# 自动下载/更新时的目标路径：优先插件参数，否则用第一个默认位置
+sub db_target_path ($db_path) {
+    return $db_path if defined $db_path && $db_path ne '';
+    my ($first) = default_db_paths();
+    return $first;
+}
+
+# 解析标签数据库路径：优先用插件参数，失败则回退到常见位置
+sub resolve_db_path ($db_path) {
+    my @candidates;
+    push @candidates, $db_path if defined $db_path && $db_path ne '';
+    push @candidates, default_db_paths();
     for my $f (@candidates) {
         next if !defined $f || $f eq '';
         return $f if -f $f;
     }
     return undef;
+}
+
+sub file_md5 ($path) {
+    open( my $fh, '<:raw', $path ) or return '';
+    my $d = Digest::MD5->new->addfile($fh);
+    close $fh;
+    return $d->hexdigest;
+}
+
+sub file_sha256 ($path) {
+    open( my $fh, '<:raw', $path ) or return '';
+    my $d = Digest::SHA->new(256)->addfile($fh);
+    close $fh;
+    return $d->hexdigest;
+}
+
+# 按需从 EhTagTranslation releases 更新 db.text.json
+# - $days 天内已更新过则跳过（默认 1 天）
+# - 先比对 GitHub API 提供的 sha256 digest，再比对下载文件的 md5，都相同则不替换
+sub update_db_if_needed ( $ua, $db_path, $days ) {
+
+    my $logger = get_plugin_logger();
+    $days = 1 if !defined $days || $days !~ /^\d+$/;
+
+    my $target = db_target_path($db_path);
+    return unless defined $target && $target ne '';
+
+    $logger->debug("Tag DB target: $target (interval=${days}d)");
+
+    # 频率限制：距离上次更新不足 $days 天则跳过（$days==0 表示每次都检查）
+    if ( $days > 0 && -f $target ) {
+        my $age   = time() - ( stat($target) )[9];
+        my $limit = $days * 86400;
+        if ( $age < $limit ) {
+            my $left_h = int( ( $limit - $age ) / 3600 );
+            $logger->info("Tag DB is fresh (updated ${age}s ago); next update check in ~${left_h}h. "
+                  . "Set the interval to 0 to force a check now." );
+            return;
+        }
+    }
+
+    my $api = 'https://api.github.com/repos/EhTagTranslation/Database/releases/latest';
+    $logger->info("Checking EhTagTranslation latest release: $api");
+
+    my $res = $ua->max_redirects(5)->get($api)->result;
+    if ( !$res || !$res->is_success ) {
+        $logger->error( "获取 EhTagTranslation 最新版本失败: " . ( $res ? "HTTP " . $res->code : 'no response' ) );
+        return;
+    }
+
+    my $release = eval { $res->json } // {};
+    my ($asset) = grep { ( $_->{name} // '' ) eq 'db.text.json' } @{ $release->{assets} // [] };
+    if ( !$asset ) {
+        $logger->error("最新 release 中未找到 db.text.json 资源（可能被限流或结构变化）");
+        return;
+    }
+
+    my $url         = $asset->{browser_download_url};
+    my $remote_dig  = $asset->{digest} // '';    # 形如 "sha256:...."
+    my $local_md5   = -f $target ? file_md5($target) : '';
+    my $local_sha   = -f $target ? file_sha256($target) : '';
+
+    # 优先用 API 的 sha256 摘要判断，无需下载
+    if ( $remote_dig =~ /^sha256:([0-9a-f]{64})$/i && $local_sha ne '' && lc($1) eq lc($local_sha) ) {
+        $logger->info("Tag DB already up to date (sha256 match), skip download");
+        utime( time(), time(), $target );
+        return;
+    }
+
+    $logger->info("Downloading latest tag DB: $url");
+    my $dl = $ua->max_redirects(5)->get($url)->result;
+    if ( !$dl || !$dl->is_success ) {
+        $logger->error( "下载 db.text.json 失败: " . ( $dl ? "HTTP " . $dl->code : 'no response' ) );
+        return;
+    }
+
+    my $tmp    = "$target.download.tmp";
+    my $out_fh;
+    if ( !open( $out_fh, '>:raw', $tmp ) ) {
+        $logger->error("无法写入临时文件 $tmp: $!");
+        return;
+    }
+    print $out_fh $dl->body;
+    close $out_fh;
+
+    my $new_md5 = file_md5($tmp);
+    if ( $local_md5 ne '' && $new_md5 ne '' && $new_md5 eq $local_md5 ) {
+        unlink $tmp;
+        $logger->info("Tag DB unchanged (md5=$new_md5), skip replace");
+        utime( time(), time(), $target );
+        return;
+    }
+
+    if ( !rename( $tmp, $target ) ) {
+        # rename 失败（跨设备/权限）时退化为覆盖写入
+        if ( open( my $in, '<:raw', $tmp ) ) {
+            my $data = do { local $/; <$in> };
+            close $in;
+            if ( open( my $out2, '>:raw', $target ) ) {
+                print $out2 $data;
+                close $out2;
+                unlink $tmp;
+            }
+            else {
+                $logger->error("无法写入 $target: $!");
+                unlink $tmp;
+                return;
+            }
+        }
+        else {
+            $logger->error("无法读取临时文件 $tmp: $!");
+            return;
+        }
+    }
+
+    $logger->info( "Tag DB updated: " . ( $local_md5 ne '' ? $local_md5 : '(none)' ) . " -> " . ( $new_md5 // '' ) );
 }
 
 # 将原tag翻译为中文tag
