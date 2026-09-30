@@ -43,6 +43,8 @@ sub plugin_info {
             { type => "bool",   desc => "优先使用标题中的漫画 ID（如果失败，则使用标题搜索）" },
             { type => "bool",   desc => "通过 db.text.json 反查并规范化标签（兼容 E-Hentai 刮削结果）", default_value => 1 },
             { type => "string", desc => "EhTagTranslation 的 db.text.json 绝对路径（留空则使用常见位置）" },
+            { type => "bool",   desc => "从文件名/标题提取作者、艺术家、团队（含 [团体 (艺术家)]，以及标题最前方无圆括号的方括号；宁滥勿缺）", default_value => 1 },
+            { type => "bool",   desc => "提取文件名/标题中所有括号内容为标签（明显的语言/汉化组会额外加入 语言:/汉化组: 命名空间）", default_value => 0 },
         ],
         oneshot_arg => "该作品在哔咔漫画的 ID(24位) 或 URL(将于确切的漫画相匹配的标签到你的档案中)",
         cooldown    => 4
@@ -55,12 +57,16 @@ sub get_tags {
 
     shift;
     my $lrr_info = shift;    # Global info hash
-    my ( $base_url, $savetitle, $addextra, $prefer_title_id, $usereverse, $db_path ) = @_;    # Plugin parameters
+    my ( $base_url, $savetitle, $addextra, $prefer_title_id, $usereverse, $db_path,
+        $extract_authors, $extract_all_brackets ) = @_;    # Plugin parameters
 
     $base_url = 'https://picaapi.picacomic.com' if !defined $base_url || $base_url eq '';
     $base_url =~ s{/+$}{};
     my $host = $base_url;
     $host =~ s{^https?://}{}i;
+
+    $extract_authors      = 1 if !defined $extract_authors;      # 默认开启：文件名/标题里的作者名
+    $extract_all_brackets = 0 if !defined $extract_all_brackets;
 
     my $logger = get_plugin_logger();
     my $ua     = $lrr_info->{user_agent};
@@ -201,7 +207,15 @@ sub get_tags {
         push @out, "更新时间:$date" if $date ne '';
     }
 
-    push @out, title_author_tags( $reverse, $title );    # 标题中 [团体 (艺术家)] 的作者匹配
+    # 从文件名/刮到的标题里补充作者名与括号标签（可开关；与作者拆分结果统一在最后去重）
+    if ($extract_authors) {
+        push @out, extract_title_author_tags( $title,                1 );
+        push @out, extract_title_author_tags( $comic->{title} // '', 1 );
+    }
+    if ($extract_all_brackets) {
+        push @out, extract_all_bracket_tags( $title,                $reverse );
+        push @out, extract_all_bracket_tags( $comic->{title} // '', $reverse );
+    }
 
     @out = dedupe(@out);    # 名人类精确去重、普通标签繁简去重
     my $tagstr = join( ', ', @out );
@@ -638,19 +652,92 @@ sub author_like_tags ($rev, $value, $prefix) {
     return @out;
 }
 
-# 从标题的 [...] / 【...】 中提取 "[团体 (艺术家)]" 形式并按作者处理
-sub title_author_tags ($rev, $title) {
+# 从存档标题（文件名）提取 "[团体 (艺术家)]" 形式的原始作者名（逻辑同 ETagCN.pm）
+sub extract_title_author_tags ($title, $bare_first = 0) {
     my $t = $title // '';
     my ( %seen, @out );
-    while ( $t =~ /[\[【]\s*([^\]】]*?)\s*[\]】]/g ) {
-        my $group = trim($1);
-        next if $group eq '' || $group !~ /[（(]/;
-        for my $tag ( author_like_tags( $rev, $group, '作者' ) ) {
-            next if $seen{$tag}++;
-            push @out, $tag;
+    my $add = sub {
+        my $tag = shift;
+        return if !defined $tag || $tag eq '';
+        return if $seen{$tag}++;
+        push @out, $tag;
+    };
+
+    if ( $bare_first
+        && $t =~ /^\s*(?:\d{4,}\s*-\s*)?[\[【]\s*([^\]】]*?)\s*[\]】]\s*\S/ )
+    {
+        my $seg = trim($1);
+        if ( $seg ne '' && $seg !~ /[（(]/ ) {
+            $add->("作者:$seg");
+            $add->("标签:$seg");
+            $add->("团队:$seg");
+            $add->("艺术家:$seg");
         }
     }
+
+    while ( $t =~ /[\[【]\s*([^\]】]*?)\s*[\]】]/g ) {
+        my $seg = trim($1);
+        next if $seg eq '';
+        next if $seg !~ /[（(]/;
+
+        $add->("作者:$seg");
+        $add->("标签:$seg");
+
+        my $outer = $seg;
+        $outer =~ s/[\[\(【（《「『][^\]\)】）》」』]*[\]\)】）》」』]//g;
+        $outer = trim($outer);
+        $add->("团队:$outer") if $outer ne '';
+        $add->("标签:$outer") if $outer ne '';
+
+        my $tmp = $seg;
+        while ( $tmp =~ /[\[\(【（《「『]([^\]\)】）》」』]*)[\]\)】）》」』]/g ) {
+            my $inner = trim($1);
+            $add->("艺术家:$inner") if $inner ne '';
+            $add->("标签:$inner") if $inner ne '';
+        }
+    }
+
     return @out;
+}
+
+# 提取标题里所有括号内容为标签；明显的语言/汉化组额外加 语言:/汉化组:
+sub extract_all_bracket_tags ($title, $rev) {
+    my $t = $title // '';
+    my ( %seen, @out );
+    my $add = sub {
+        my $tag = shift;
+        return if !defined $tag || $tag eq '';
+        return if $seen{$tag}++;
+        push @out, $tag;
+    };
+    my $emit = sub {
+        my $c = shift;
+        return if $c eq '';
+        $add->("标签:$c");
+        my $lang = detect_lang_key($c);
+        if ( $lang ne '' ) {
+            my $cn = $rev ? canonicalize_tag( $rev, $lang ) : '';
+            $add->( $cn ne '' ? $cn : "语言:$lang" );
+        }
+        $add->("汉化组:$c") if is_scanlation_group($c);
+    };
+
+    while ( $t =~ /[\[【]\s*([^\]】]*?)\s*[\]】]/g ) { $emit->( trim($1) ) }
+    while ( $t =~ /[（(]\s*([^）)]*?)\s*[）)]/g )    { $emit->( trim($1) ) }
+
+    return @out;
+}
+
+sub detect_lang_key ($c) {
+    return 'chinese'  if $c =~ /(中国语|中国語|中文|中國|简体|简中|繁體|繁体|繁中|中国翻訳|中国翻译|汉化|漢化|chinese|\bchs?\b|\bcht\b|\bchi\b)/i;
+    return 'japanese' if $c =~ /(日本語|日本语|日语|日文|japanese|\bjpn?\b)/i;
+    return 'english'  if $c =~ /(english|\beng\b|英语|英語)/i;
+    return 'korean'   if $c =~ /(korean|한국어|한글|韩语|韓語)/i;
+    return '';
+}
+
+sub is_scanlation_group ($c) {
+    return $c =~ /(汉化组|漢化組|汉化社|漢化社|翻译组|翻譯組|字幕组|字幕組|扫图组|掃圖組|嵌字|汉化|漢化)/ ? 1 : 0;
 }
 
 # 匹配则返回规范标签；未命中时至少做繁→简（保证与 EH 简体一致），实在没映射才用原文

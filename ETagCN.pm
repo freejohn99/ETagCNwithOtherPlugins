@@ -12,7 +12,7 @@ use utf8;
 #Try however to restrain yourself to the ones already installed for LRR (see tools/cpanfile) to avoid extra installations by the end-user.
 use URI::Escape;
 use Mojo::JSON qw(decode_json encode_json);
-use Mojo::Util qw(html_unescape);
+use Mojo::Util qw(html_unescape trim);
 use Mojo::UserAgent;
 use Digest::MD5;
 use Digest::SHA;
@@ -50,6 +50,8 @@ sub plugin_info {
             { type => "string", desc => "EhTagTranslation项目的JSON数据库文件(db.text.json)的绝对路径" },
             { type => "bool", desc => "自动更新标签数据库（从 EhTagTranslation releases 下载最新 db.text.json，需联网）" },
             { type => "int",  desc => "标签数据库更新检查间隔（天），默认 1；填 0 表示每次都检查" },
+            { type => "bool", desc => "从文件名/标题提取作者、艺术家、团队（含 [团体 (艺术家)]，以及标题最前方无圆括号的方括号；宁滥勿缺）" },
+            { type => "bool", desc => "提取文件名/标题中所有括号内容为标签（明显的语言/汉化组会额外加入 语言:/汉化组: 命名空间）" },
         ],
         oneshot_arg => "该漫画在e-hentai的URL(将于确切的漫画相匹配的标签到你的档案中)",
         cooldown    => 4
@@ -66,9 +68,11 @@ sub get_tags {
     my $lrr_info = shift;                                                                               # Global info hash
     my $ua       = $lrr_info->{user_agent};
     my ( $lang, $savetitle, $usethumbs, $search_gid, $enablepanda, $jpntitle, $additionaltags, $expunged, $db_path,
-        $autoupdate_db, $db_update_days ) = @_;    # Plugin parameters
+        $autoupdate_db, $db_update_days, $extract_authors, $extract_all_brackets ) = @_;    # Plugin parameters
 
     $db_update_days = 1 if !defined $db_update_days || $db_update_days !~ /^\d+$/;
+    $extract_authors = 1 if !defined $extract_authors;    # 默认开启：文件名/标题里的作者名
+    $extract_all_brackets = 0 if !defined $extract_all_brackets;
 
     # Use the logger to output status - they'll be passed to a specialized logfile and written to STDOUT.
     my $logger = get_plugin_logger();
@@ -117,7 +121,11 @@ sub get_tags {
         $logger->info("Using gallery $gID / $gToken");
     }
 
-    my ( $ehtags, $ehtitle ) = &get_tags_from_EH( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path, $autoupdate_db, $db_update_days );
+    my ( $ehtags, $ehtitle ) = &get_tags_from_EH(
+        $ua,            $gID,              $gToken,     $jpntitle,   $additionaltags, $db_path,
+        $autoupdate_db, $db_update_days,   $lrr_info->{archive_title}, $extract_authors, $extract_all_brackets
+    );
+
     my %hashdata = ( tags => $ehtags );
 
     # Add source URL and title if possible/applicable
@@ -154,6 +162,121 @@ sub extract_gid_from_title ($title) {
     }
 
     return "";
+}
+
+# extract_title_author_tags(title)
+# 从存档标题（文件名）里提取 "[团体 (艺术家)]" 形式的原始（通常为日文）作者名，
+# 逻辑与 WnacgCN/PicacgCN 的 title_author_tags 一致：
+#   作者:<完整名>  /  团队:<括号外>  /  艺术家:<括号内>
+# JSON 标签数据库里没有日文原名（key 是罗马字、name 是中文译文），所以日文原名要从标题里取。
+sub extract_title_author_tags ($title, $bare_first = 0) {
+
+    my $t = $title // '';
+    my ( %seen, @out );
+    my $add = sub {
+        my $tag = shift;
+        return if !defined $tag || $tag eq '';
+        return if $seen{$tag}++;
+        push @out, $tag;
+    };
+
+    # 标题最前方（允许前导 gid，如 "4210316-[...] 标题"）的第一个方括号，
+    # 若内部没有圆括号，则作者/团队/艺术家都用它（宁滥勿缺）。要求 ] / 】 后面还有标题文字。
+    if ($bare_first
+        && $t =~ /^\s*(?:\d{4,}\s*-\s*)?[\[【]\s*([^\]】]*?)\s*[\]】]\s*\S/ )
+    {
+        my $seg = trim($1);
+        if ( $seg ne '' && $seg !~ /[（(]/ ) {
+            # 无圆括号：作者/团队/艺术家 都用该内容，并保留 标签:完整名
+            $add->("作者:$seg");
+            $add->("标签:$seg");
+            $add->("团队:$seg");
+            $add->("艺术家:$seg");
+        }
+    }
+
+    while ( $t =~ /[\[【]\s*([^\]】]*?)\s*[\]】]/g ) {
+        my $seg = trim($1);
+        next if $seg eq '';
+        next if $seg !~ /[（(]/;    # 含圆括号的 "[团体 (艺术家)]"
+
+        $add->("作者:$seg");
+        $add->("标签:$seg");
+
+        # 括号剥离：外层=团队，括号内=艺术家；拆分出的名字再各补一个 标签: 形态
+        my $outer = $seg;
+        $outer =~ s/[\[\(【（《「『][^\]\)】）》」』]*[\]\)】）》」』]//g;
+        $outer = trim($outer);
+        $add->("团队:$outer") if $outer ne '';
+        $add->("标签:$outer") if $outer ne '';
+
+        my $tmp = $seg;
+        while ( $tmp =~ /[\[\(【（《「『]([^\]\)】）》」』]*)[\]\)】）》」』]/g ) {
+            my $inner = trim($1);
+            $add->("艺术家:$inner") if $inner ne '';
+            $add->("标签:$inner") if $inner ne '';
+        }
+    }
+
+    return @out;
+}
+
+# extract_all_bracket_tags(title)
+# 提取标题里所有括号内容（[]【】 与 ()（）），每项生成 "标签:<内容>"。
+# 明显是语言/汉化组的，额外生成 "语言:<key>" / "汉化组:<内容>"。
+sub extract_all_bracket_tags ($title) {
+
+    my $t = $title // '';
+    my ( %seen, @out );
+    my $add = sub {
+        my $tag = shift;
+        return if !defined $tag || $tag eq '';
+        return if $seen{$tag}++;
+        push @out, $tag;
+    };
+
+    my $emit = sub {
+        my $c = shift;
+        return if $c eq '';
+        $add->("标签:$c");
+        my $lang = detect_lang_key($c);
+        $add->("language:$lang") if $lang ne '';    # 用英文命名空间，便于与 EH 的 language:xxx 去重
+        $add->("汉化组:$c")      if is_scanlation_group($c);
+    };
+
+    # 方括号内容（可能包含圆括号）
+    while ( $t =~ /[\[【]\s*([^\]】]*?)\s*[\]】]/g ) { $emit->( trim($1) ) }
+    # 圆括号内容
+    while ( $t =~ /[（(]\s*([^）)]*?)\s*[）)]/g )     { $emit->( trim($1) ) }
+
+    return @out;
+}
+
+# 从括号内容判断语言，返回数据库 language 命名空间的 key（用英文 key 才能被翻译成中文）
+sub detect_lang_key ($c) {
+    return 'chinese'  if $c =~ /(中国语|中国語|中文|中國|简体|简中|繁體|繁体|繁中|中国翻訳|中国翻译|汉化|漢化|chinese|\bchs?\b|\bcht\b|\bchi\b)/i;
+    return 'japanese' if $c =~ /(日本語|日本语|日语|日文|japanese|\bjpn?\b)/i;
+    return 'english'  if $c =~ /(english|\beng\b|英语|英語)/i;
+    return 'korean'   if $c =~ /(korean|한국어|한글|韩语|韓語)/i;
+    return '';
+}
+
+# 是否像汉化组/翻译组
+sub is_scanlation_group ($c) {
+    return $c =~ /(汉化组|漢化組|汉化社|漢化社|翻译组|翻譯組|字幕组|字幕組|扫图组|掃圖組|嵌字|汉化|漢化)/ ? 1 : 0;
+}
+
+# 精确（不区分大小写）去重，保持顺序
+sub dedupe_tags (@list) {
+    my ( %seen, @out );
+    for my $x (@list) {
+        next if !defined $x;
+        my $t = trim($x);
+        next if $t eq '';
+        next if $seen{ lc($t) }++;
+        push @out, $t;
+    }
+    return @out;
 }
 
 sub lookup_gallery ( $title, $tags, $thumbhash, $ua, $domain, $defaultlanguage, $usethumbs, $search_gid, $expunged ) {
@@ -351,9 +474,9 @@ sub search_gallery ( $url, $ua ) {
     return ( $res->dom, undef );
 }
 
-# get_tags_from_EH(userAgent, gID, gToken, jpntitle, additionaltags, db_path, autoupdate_db, db_update_days)
+# get_tags_from_EH(userAgent, gID, gToken, jpntitle, additionaltags, db_path, autoupdate_db, db_update_days, archive_title, extract_authors, extract_all_brackets)
 # Executes an e-hentai API request with the given JSON and returns tags and title.
-sub get_tags_from_EH ( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path, $autoupdate_db, $db_update_days ) {
+sub get_tags_from_EH ( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path, $autoupdate_db, $db_update_days, $archive_title, $extract_authors, $extract_all_brackets ) {
 
     my $uri = 'https://api.e-hentai.org/api.php';
 
@@ -392,8 +515,21 @@ sub get_tags_from_EH ( $ua, $gID, $gToken, $jpntitle, $additionaltags, $db_path,
     # Unescape title received from the API as it might contain some HTML characters
     $ehtitle = html_unescape($ehtitle);
 
+    # 从文件名与刮到的（日文）标题里补充原始作者名 / 括号标签。
+    # 放在翻译之前，这样 语言:chinese 这类会被数据库统一翻译成“语言:汉语”。
+    if ($extract_authors) {
+        push @tags, extract_title_author_tags( $archive_title // '', 1 );
+        push @tags, extract_title_author_tags( $ehtitle,        1 );
+    }
+    if ($extract_all_brackets) {
+        push @tags, extract_all_bracket_tags( $archive_title // '' );
+        push @tags, extract_all_bracket_tags( $ehtitle );
+    }
+    @tags = dedupe_tags(@tags);
+
     # 中文转换
     my $cntags = translate_tag_to_cn( \@tags, $db_path );
+    $cntags = [ dedupe_tags(@$cntags) ];    # 翻译后可能产生重复（如 language:chinese 与 语言:chinese）
 
     my $ehtags = join( ', ', @$cntags );
     $logger->info("Sending the following tags to LRR: $ehtags");
