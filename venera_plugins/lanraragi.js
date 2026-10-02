@@ -2,13 +2,18 @@
 class Lanraragi extends ComicSource {
     name = "Lanraragi"
     key = "lanraragi"
-    version = "1.3.0"
+    version = "2.0.0"
     minAppVersion = "1.4.0"
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/lanraragi.js"
 
+    // 最近一次随机入口选中的真实 arcid（用于在详情页标签里加 Random 标记）
+    _randomEntryId = null
+
     settings = {
         api: { title: "API", type: "input", default: "http://lrr.tvc-16.science" },
-        apiKey: { title: "APIKEY", type: "input", default: "" }
+        apiKey: { title: "APIKEY", type: "input", default: "" },
+        randomCount: { title: "随机数量", type: "input", default: "30" },
+        showRandomEntry: { title: "显示随机入口", type: "switch", default: true }
     }
 
     get baseUrl() { 
@@ -27,19 +32,19 @@ class Lanraragi extends ComicSource {
         return headers
     }
 
-    // 临时的折中手段，app 尚不支持 api token 形式的授权判断（isLogged）
+    // APIKEY 直接取自设置，登录时不再二次输入。
+    // fields 为空数组时，登录页不会显示任何输入框，点一下按钮即用设置里的 APIKEY 完成校验。
     account = {
       loginWithCookies: {
-        fields: ["apiKey"],
-        validate: function(cookies) {
-          var provided = (cookies && cookies.length > 0) ? cookies[0] : '';
-          if (provided && provided.length > 0) {
-            return true;
-          }
-          return false;
+        fields: [],
+        // 必须用箭头函数：Venera 调用的是 account.loginWithCookies.validate(...)，
+        // 普通函数的 this 会指向 loginWithCookies 而不是源实例，导致 this.loadSetting 不存在。
+        validate: (cookies) => {
+          const key = this.loadSetting('apiKey')
+          return !!(key && String(key).trim().length > 0)
         }
       },
-      logout: function() {
+      logout: () => {
         this.deleteData("account");
       }
     }
@@ -93,6 +98,70 @@ class Lanraragi extends ComicSource {
         } catch (_) {
             return buffer
         }
+    }
+
+    _randomCount() {
+        const v = parseInt(this.loadSetting('randomCount'), 10)
+        if (isNaN(v) || v <= 0) return 30
+        return Math.min(v, 200)
+    }
+
+    _showRandomEntry() {
+        const v = this.loadSetting('showRandomEntry')
+        return (v === undefined || v === null) ? true : !!v
+    }
+
+    // 随机入口卡片：每次列表加载（含发现页刷新）都直接请求随机接口取一部真实漫画，
+    // 展示其真实封面/标题/标签；id 用真实 arcid，点进详情页就是这一部。
+    // 详情页不再随机（刷新只重载同一部），从而保证列表与详情一致。
+    async _randomEntryComic(base) {
+        const b = (base || '').replace(/\/+$/, '') || this.baseUrl
+        try {
+            const list = await this._fetchRandomArchives(b, 1)
+            const item = list && list[0]
+            if (item && item.arcid) {
+                this._randomEntryId = item.arcid
+                this.saveData('random_entry_id', item.arcid)
+                return this._buildRandomCard(b, item)
+            }
+        } catch (_) {}
+        return null
+    }
+
+    _buildRandomCard(b, info) {
+        const cover = `${b}/api/archives/${info.arcid}/thumbnail`
+        const tags = this._cleanListTags(info.tags)
+        if (!tags.includes('随机:Lanraragi(Random)')) tags.unshift('随机:Lanraragi(Random)')
+        const tagRating = this._extractRatingFromTags(info.tags)
+        const stars = this._toStarsFromValue(tagRating ?? null)
+        return new Comic({
+            id: info.arcid,
+            title: info.title || info.filename || info.arcid,
+            subTitle: '',
+            cover,
+            tags,
+            description: '页数: ' + (info.pagecount || '') + ' | 新: ' + (info.isnew || '') + ' | 扩展: ' + (info.extension || ''),
+            stars
+        })
+    }
+
+    // 调用 LRR 的 /api/search/random，返回随机的档案列表
+    async _fetchRandomArchives(base, count, filter, newonly, untaggedonly, groupby) {
+        const b = (base || '').replace(/\/+$/, '') || this.baseUrl
+        const qp = []
+        const add = (k, v) => qp.push(`${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+        if (filter) add('filter', filter)
+        add('count', String(count || 1))
+        add('newonly', String(newonly === true || newonly === 'true'))
+        add('untaggedonly', String(untaggedonly === true || untaggedonly === 'true'))
+        add('groupby_tanks', String(!(groupby === false || groupby === 'false')))
+        // 加时间戳做缓存穿透，避免任何 HTTP 缓存返回同一批随机结果（同 Mihon 的 FORCE_NETWORK）
+        add('_', String(Date.now()))
+        const url = `${b}/api/search/random?${qp.join('&')}`
+        const res = await Network.get(url, this.headers)
+        if (res.status !== 200) throw `Invalid status code: ${res.status}`
+        const data = JSON.parse(res.body)
+        return Array.isArray(data.data) ? data.data : []
     }
 
     // Parse various rating string/number formats and convert to 0-5 scale with 0.5 step
@@ -188,6 +257,13 @@ class Lanraragi extends ComicSource {
     }
 
     async init() {
+        // 只要设置里填了 APIKEY 就视为已登录，免去再点一次登录；
+        // 没填 APIKEY 时清除登录状态。
+        // 直接标记为已登录，省去「点登录 → 进子页面 → 再点一次」的多余流程。
+        // 实际鉴权完全由设置里的 APIKEY 决定：未填时收藏/评分会提示需要 API token；
+        // 需要“登出”时清空 APIKEY 即可。
+        this.saveData('account', 'ok')
+
         try {
             const url = `${this.baseUrl}/api/categories`
             const res = await Network.get(url, this.headers)
@@ -246,7 +322,12 @@ class Lanraragi extends ComicSource {
             const serverPage = returned || 1
             const maxPage = Math.max(1, Math.ceil(total / serverPage))
 
-            return { comics: list.map(parseComic), maxPage }
+            const comics = list.map(parseComic)
+            if (page === 1 && this._showRandomEntry()) {
+                const randomEntry = await this._randomEntryComic(base)
+                if (randomEntry) comics.unshift(randomEntry)
+            }
+            return { comics, maxPage }
         }}
     ]
 
@@ -359,8 +440,32 @@ class Lanraragi extends ComicSource {
             const newonly = String(pick(2, 'false'))
             const untaggedonly = String(pick(3, 'false'))
             const groupby = String(pick(4, 'true'))
+            const filter = (keyword || '').trim()
+            const isRandom = String(order).toLowerCase() === 'random'
 
-            add('filter', (keyword || '').trim())
+            const toComic = (item) => {
+                const cover = `${base}/api/archives/${item.arcid}/thumbnail`
+                const tags = this._cleanListTags(item.tags)
+                const tagRating = this._extractRatingFromTags(item.tags)
+                const stars = this._toStarsFromValue(tagRating ?? null)
+                return new Comic({
+                    id: item.arcid,
+                    title: item.title || item.filename || item.arcid,
+                    subTitle: '',
+                    cover,
+                    tags,
+                    description: '页数: ' + (item.pagecount || '') + ' | 新: ' + (item.isnew || '') + ' | 扩展: ' + (item.extension || ''),
+                    stars
+                })
+            }
+
+            // 随机排序：改用 /api/search/random，直接用服务端返回的顺序（不在插件端洗牌）
+            if (isRandom) {
+                const list = await this._fetchRandomArchives(base, this._randomCount(), filter, newonly, untaggedonly, groupby)
+                return { comics: list.map(toComic), maxPage: (Number(page) || 1) + 1 }
+            }
+
+            add('filter', filter)
             add('sortby', sortby)
             add('order', order)
             add('newonly', newonly)
@@ -382,21 +487,7 @@ class Lanraragi extends ComicSource {
             const data = JSON.parse(res.body)
             const list = Array.isArray(data.data) ? data.data : []
 
-            const comics = list.map(item => {
-                const cover = `${base}/api/archives/${item.arcid}/thumbnail`
-                const tags = this._cleanListTags(item.tags)
-                const tagRating = this._extractRatingFromTags(item.tags)
-                const stars = this._toStarsFromValue(tagRating ?? null)
-                return new Comic({
-                    id: item.arcid,
-                    title: item.title || item.filename || item.arcid,
-                    subTitle: '',
-                    cover,
-                    tags,
-                    description: '页数: ' + (item.pagecount || '') + ' | 新: ' + (item.isnew || '') + ' | 扩展: ' + (item.extension || ''),
-                    stars
-                })
-            })
+            const comics = list.map(toComic)
 
             const returned = list.length
             this.saveData(searchKey, start + returned)
@@ -406,11 +497,9 @@ class Lanraragi extends ComicSource {
                 : (start + returned)
             const serverPage = returned || 1
             const maxPage = Math.max(1, Math.ceil(total / serverPage))
+
+            // 随机入口只在发现页展示，搜索/标签/分类页不再插入
             return { comics, maxPage }
-        },
-        loadNext: async (keyword, options, next) => {
-            const page = (typeof next === 'number' && next > 0) ? next : 1
-            return await this.search.load(keyword, options, page)
         },
         // 注意：不要设置 default 字段。Venera 会把 default 值 JSON 编码后作为
         // defaultValue（例如 "title" -> "\"title\""），既不会命中任何选项 key 导致选项
@@ -418,7 +507,7 @@ class Lanraragi extends ComicSource {
         // 不设置 default 时 Venera 会取第一个选项作为默认值，因此把想要的默认项放在首位即可。
         optionList: [
             { type: "select", options: ["title-按标题","date_added-最新添加","lastread-最近阅读"], label: "sortby" },
-            { type: "select", options: ["asc-升序","desc-降序"], label: "order" },
+            { type: "select", options: ["asc-升序","desc-降序","random-随机"], label: "order" },
             { type: "select", options: ["false-全部","true-仅新"], label: "newonly" },
             { type: "select", options: ["false-全部","true-仅未打标签"], label: "untaggedonly" },
             { type: "select", options: ["true-启用","false-禁用"], label: "groupby_tanks" }
@@ -553,6 +642,14 @@ class Lanraragi extends ComicSource {
                 }
 
                 const tagsObj = {}
+                // 若这是随机入口选中的那部，在最前面加一个「随机: Lanraragi(Random)」标记。
+                // 组名用「随机」，值用「Lanraragi(Random)」，这样在会隐藏组名的客户端（如 VeneraX）
+                // 也能显示成 Lanraragi(Random)，在原版 Venera 显示为 “随机: Lanraragi(Random)”。
+                const randomEntryId = this._randomEntryId || this.loadData('random_entry_id')
+                if (randomEntryId && String(id) === String(randomEntryId)) {
+                    const cur = Array.isArray(tagsObj['随机']) ? tagsObj['随机'] : []
+                    if (!cur.includes('Lanraragi(Random)')) tagsObj['随机'] = ['Lanraragi(Random)'].concat(cur)
+                }
                 for (const [k, v] of nsMap.entries()) {
                     tagsObj[k] = v
                 }
@@ -588,6 +685,11 @@ class Lanraragi extends ComicSource {
                         keep.push(val)
                     }
                     tagsObj[key] = keep
+                }
+                // 移除空分组（例如 source 的值已并入描述，不再显示为空标签组）
+                for (const key of Object.keys(tagsObj)) {
+                    const arr = tagsObj[key]
+                    if (Array.isArray(arr) && arr.length === 0) delete tagsObj[key]
                 }
 
                 let summary = data.summary || ''
@@ -723,9 +825,15 @@ class Lanraragi extends ComicSource {
         // voteComment: async (id, subId, commentId, isUp, isCancel) => {},
         // idMatch: null,
         onClickTag: (namespace, tag) => {
-            // Pages 和 Extension 不可点击
             const ns = namespace ? String(namespace) : ''
             const nsLower = ns.toLowerCase()
+
+            // 随机标记可点击：跳转到搜索页并随机排序全部作品
+            // options 顺序与 search.optionList 一致：sortby, order, newonly, untaggedonly, groupby_tanks
+            if (String(tag) === 'Lanraragi(Random)') {
+                return { page: 'search', attributes: { text: '', options: ['date_added', 'random', 'false', 'false', 'true'] } }
+            }
+            // Pages/Extension 不可点击（Source 标签已并入描述，不会出现在标签列表里）
             if (nsLower === 'pages' || nsLower === 'extension') return null
 
             // 'Tags' 是本插件为「无命名空间标签」合成的分组名。
@@ -739,7 +847,10 @@ class Lanraragi extends ComicSource {
             return { action: 'search', keyword: term, param: null }
         },
         // link: { domains: ['example.com'], linkToId: (url) => null },
-        enableTagsTranslate: true,
+        // 关闭 App 内置的标签值翻译：它会把所有标签值转成小写
+        // （TagsTranslation.translationTagWithNamespace 里 text.toLowerCase()），
+        // LRR 的标签是用户自定义的，保留原样更合适（组名仍由本插件 translation 翻译）。
+        enableTagsTranslate: false,
     }
 
     translation = {
@@ -768,6 +879,14 @@ class Lanraragi extends ComicSource {
             "Series": "系列",
             "Pages": "页数",
             "Extension": "文件类型",
+            "随机数量": "随机数量",
+            "显示随机入口": "显示随机入口",
+            "随机": "随机",
+            "内置": "内置",
+            "分类": "分类",
+            "全部漫画": "全部漫画",
+            "新档案": "新档案",
+            "无标签档案": "无标签档案",
         },
         'en_US': {
             "language": "Language",
@@ -794,6 +913,14 @@ class Lanraragi extends ComicSource {
             "Series": "Series",
             "Pages": "Pages",
             "Extension": "Extension",
+            "随机数量": "Random count",
+            "显示随机入口": "Show random entry",
+            "随机": "Random",
+            "内置": "Built-in",
+            "分类": "Categories",
+            "全部漫画": "All",
+            "新档案": "New",
+            "无标签档案": "Untagged",
         }
     }
 }
