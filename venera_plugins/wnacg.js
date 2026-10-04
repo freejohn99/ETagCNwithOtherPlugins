@@ -7,7 +7,7 @@ class Wnacg extends ComicSource {
     // unique id of the source
     key = "wnacg"
 
-    version = "1.1.0"
+    version = "1.1.1"
 
     minAppVersion = "1.0.0"
 
@@ -190,8 +190,8 @@ class Wnacg extends ComicSource {
         return out
     }
 
-    // 从合集章节目录链接追加章节（key 为章节 aid）
-    _appendChapters(chapters, elements) {
+    // 追加合集章节：chapters 的 key=章节名（决定下载文件夹与显示），chapterMap 记录 名称 -> 章节 aid
+    _appendChapters(chapters, chapterMap, elements) {
         for (let a of elements) {
             let attrs = a.attributes || {}
             let chid = attrs["data-chid"]
@@ -199,11 +199,55 @@ class Wnacg extends ComicSource {
                 let m = RegExp("(?<=-aid-)[0-9]+").exec(attrs["href"] || "")
                 if (m) chid = m[0]
             }
-            let name = (a.text || '').replace(/\s+/g, ' ').trim()
-            if (chid && name && !chapters.has(chid)) {
-                chapters.set(chid, name)
+            if (!chid) continue
+            // 按章节 aid 去重
+            let exists = false
+            for (let k in chapterMap) {
+                if (chapterMap[k] === chid) { exists = true; break }
             }
+            if (exists) continue
+            let name = (a.text || '').replace(/\s+/g, ' ').trim() || `第${chapters.size + 1}話`
+            let unique = name
+            let suffix = 2
+            while (chapters.has(unique)) {
+                unique = `${name} (${suffix++})`
+            }
+            chapters.set(unique, unique)
+            chapterMap[unique] = chid
         }
+    }
+
+    // 抓取合集完整章节目录，返回 { chapters(名->名), chapterMap(名->aid) }
+    async _collectChapterDirectory(id, firstDocument) {
+        let chapters = new Map()
+        let chapterMap = {}
+        let doc = firstDocument
+        if (!doc) {
+            let res = await Network.get(`${this.baseUrl}/photos-index-page-1-aid-${id}.html`, {})
+            if (res.status !== 200) {
+                throw `Invalid Status Code ${res.status}`
+            }
+            doc = new HtmlDocument(res.body)
+        }
+        this._appendChapters(chapters, chapterMap, doc.querySelectorAll("div.sr_compact > a[data-chid]"))
+        // 章节目录分页：页码取所有分页链接中的最大数字（末端还有「後頁」链接）
+        let maxPage = 1
+        let pageLinks = doc.querySelectorAll("div.f_left.paginator > a")
+        for (let link of pageLinks) {
+            let n = parseInt(link.text)
+            if (!isNaN(n) && n > maxPage) maxPage = n
+        }
+        if (!firstDocument) doc.dispose()
+        const MAX_CHAPTER_PAGES = 30
+        let lastPage = Math.min(maxPage, MAX_CHAPTER_PAGES)
+        for (let p = 2; p <= lastPage; p++) {
+            let r = await Network.get(`${this.baseUrl}/photos-index-aid-${id}-page-${p}.html`, {})
+            if (r.status !== 200) break
+            let d = new HtmlDocument(r.body)
+            this._appendChapters(chapters, chapterMap, d.querySelectorAll("div.sr_compact > a[data-chid]"))
+            d.dispose()
+        }
+        return { chapters: chapters, chapterMap: chapterMap }
     }
 
     parseComic(c) {
@@ -713,31 +757,20 @@ class Wnacg extends ComicSource {
             let isCollection = chapterEls.length > 0
             let chapters = new Map()
             if (isCollection) {
-                this._appendChapters(chapters, chapterEls)
-
-                // 章节目录分页：页码取所有分页链接中的最大数字（末端还有「後頁」链接）
-                let maxPage = 1
-                let pageLinks = document.querySelectorAll("div.f_left.paginator > a")
-                for (let link of pageLinks) {
-                    let n = parseInt(link.text)
-                    if (!isNaN(n) && n > maxPage) maxPage = n
-                }
-                const MAX_CHAPTER_PAGES = 30
-                let lastPage = Math.min(maxPage, MAX_CHAPTER_PAGES)
-                for (let p = 2; p <= lastPage; p++) {
-                    let r = await Network.get(`${this.baseUrl}/photos-index-aid-${id}-page-${p}.html`, {})
-                    if (r.status !== 200) break
-                    let d = new HtmlDocument(r.body)
-                    this._appendChapters(chapters, d.querySelectorAll("div.sr_compact > a[data-chid]"))
-                    d.dispose()
-                }
-                // 记录第 1 话 id：Venera 预览点击固定进入第 1 话，故预览展示第 1 话内容
+                // 以章节名作为章节 id：Venera 用 id 作为下载文件夹名，这样下载即为章节名
+                let collected = await this._collectChapterDirectory(id, document)
+                chapters = collected.chapters
                 if (chapters.size > 0) {
-                    this.saveData('wnacgFirstEp_' + id, chapters.keys().next().value)
+                    let firstKey = chapters.keys().next().value
+                    // 预览用：第 1 话 aid（Venera 预览点击固定进入第 1 话）
+                    this.saveData('wnacgFirstEp_' + id, collected.chapterMap[firstKey])
+                    // 阅读用：章节名 -> aid 映射
+                    this.saveData('wnacgChapterMap_' + id, collected.chapterMap)
                 }
             } else {
-                // 非合集清理可能残留的第 1 话记录
+                // 非合集清理可能残留的数据
                 this.deleteData('wnacgFirstEp_' + id)
+                this.deleteData('wnacgChapterMap_' + id)
             }
 
             let descriptionEl = document.querySelector("div.asTBcell.uwconn > p")
@@ -810,8 +843,29 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{images: string[]}>}
          */
         loadEp: async (comicId, epId) => {
-            // 合集某话：epId 为章节 aid；普通相册：epId 为空，读 comicId 自身
-            let targetId = (epId && String(epId) !== '0') ? String(epId) : comicId
+            // 合集某话：epId 为章节名，需映射回章节 aid；普通相册：epId 为空，读 comicId 自身
+            let targetId = comicId
+            if (epId) {
+                let s = String(epId)
+                if (s === '0') {
+                    targetId = comicId
+                } else if (/^[0-9]+$/.test(s)) {
+                    targetId = s
+                } else {
+                    let map = this.loadData('wnacgChapterMap_' + comicId)
+                    if (!map || !map[s]) {
+                        // 映射缺失（如数据被清理）时重建章节目录
+                        let collected = await this._collectChapterDirectory(comicId, null)
+                        map = collected.chapterMap
+                        this.saveData('wnacgChapterMap_' + comicId, map)
+                        if (collected.chapters.size > 0) {
+                            let firstKey = collected.chapters.keys().next().value
+                            this.saveData('wnacgFirstEp_' + comicId, map[firstKey])
+                        }
+                    }
+                    targetId = (map && map[s]) ? map[s] : s
+                }
+            }
             let res = await Network.get(`${this.baseUrl}/photos-gallery-aid-${targetId}.html`, {})
             if (res.status !== 200) {
                 throw `Invalid Status Code ${res.status}`
