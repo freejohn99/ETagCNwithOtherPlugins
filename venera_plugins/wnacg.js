@@ -7,12 +7,12 @@ class Wnacg extends ComicSource {
     // unique id of the source
     key = "wnacg"
 
-    version = "1.0.5"
+    version = "1.1.0"
 
     minAppVersion = "1.0.0"
 
     // update url
-    url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/wnacg.js"
+    url = "https://raw.githubusercontent.com/freejhon99/ETagCNwithOtherPlugins/master/venera_plugins/wnacg.js"
 
     static domains = [];
 
@@ -164,12 +164,53 @@ class Wnacg extends ComicSource {
         }
     }
 
+    // 统一封面/图片 URL：兼容 //host 与 ////host 两种写法
+    _normalizeCover(url) {
+        let u = String(url || '').trim()
+        if (!u) return u
+        if (/^https?:\/\//i.test(u)) return u
+        return 'https://' + u.replace(/^\/+/, '')
+    }
+
+    // 按 / 或 ／ 拆分并去除空白
+    _splitValues(value) {
+        return String(value || '').split(/[/／]/).map((x) => x.trim()).filter((x) => x.length > 0)
+    }
+
+    // 去重（保持顺序）
+    _dedupe(arr) {
+        let seen = new Set()
+        let out = []
+        for (let v of arr) {
+            if (v && !seen.has(v)) {
+                seen.add(v)
+                out.push(v)
+            }
+        }
+        return out
+    }
+
+    // 从合集章节目录链接追加章节（key 为章节 aid）
+    _appendChapters(chapters, elements) {
+        for (let a of elements) {
+            let attrs = a.attributes || {}
+            let chid = attrs["data-chid"]
+            if (!chid) {
+                let m = RegExp("(?<=-aid-)[0-9]+").exec(attrs["href"] || "")
+                if (m) chid = m[0]
+            }
+            let name = (a.text || '').replace(/\s+/g, ' ').trim()
+            if (chid && name && !chapters.has(chid)) {
+                chapters.set(chid, name)
+            }
+        }
+    }
+
     parseComic(c) {
         let link = c.querySelector("div.pic_box > a").attributes["href"];
         let id = RegExp("(?<=-aid-)[0-9]+").exec(link)[0];
-        let image =
-            c.querySelector("div.pic_box > a > img").attributes["src"];
-        image = `https:${image}`;
+        let image = this._normalizeCover(
+            c.querySelector("div.pic_box > a > img").attributes["src"]);
         let name = c.querySelector("div.info > div.title > a").text;
         let info = c.querySelector("div.info > div.info_col").text.trim();
         info = info.replaceAll('\n', '');
@@ -639,32 +680,97 @@ class Wnacg extends ComicSource {
                 throw `Invalid Status Code ${res.status}`
             }
             let document = new HtmlDocument(res.body)
-            let title = document.querySelector("div.userwrap > h2").text
-            let cover = document.querySelector("div.userwrap > div.asTB > div.asTBcell.uwthumb > img").attributes["src"]
-            cover = 'https:' + cover
-            cover = cover.substring(0, 6) + cover.substring(8)
-            let labels = document.querySelectorAll("div.asTBcell.uwconn > label")
-            let category = labels[0].text.split("：")[1]
-            let pages = labels[1].text.split("：")[1];
-            let tagsDom = document.querySelectorAll("a.tagshow");
-            let tags = new Map()
-            tags.set("頁數", [pages])
-            tags.set("分類", [category])
-            if (tagsDom.length > 0) {
-                tags.set("標籤", tagsDom.map((e) => e.text))
-            }
-            let description = document.querySelector("div.asTBcell.uwconn > p").text;
-            let uploader = document.querySelector("div.asTBcell.uwuinfo > a > p").text;
 
-            return new ComicDetails({
-                id: id,
+            let titleEl = document.querySelector("div.userwrap > h2")
+            let title = titleEl ? titleEl.text : ''
+
+            let coverEl = document.querySelector("div.userwrap > div.asTB > div.asTBcell.uwthumb > img")
+            let cover = coverEl ? this._normalizeCover(coverEl.attributes["src"]) : ''
+
+            // 解析信息标签，按冒号拆分，不依赖标签顺序
+            let labelMap = {}
+            let labels = document.querySelectorAll("div.asTBcell.uwconn > label")
+            for (let label of labels) {
+                let text = label.text || ''
+                let idx = text.search(/[：:]/)
+                if (idx > 0) {
+                    labelMap[text.slice(0, idx).trim()] = text.slice(idx + 1).trim()
+                }
+            }
+
+            // 真实标签位于 div.addtags 内；合集章节链接在 div.sr_compact，不会误入
+            let rawTags = []
+            let tagEls = document.querySelectorAll("div.addtags a.tagshow")
+            for (let a of tagEls) {
+                let text = (a.text || '').trim()
+                if (!text) continue
+                rawTags.push(...this._splitValues(text))
+            }
+            rawTags = this._dedupe(rawTags)
+
+            // 合集检测：章节目录容器 div.sr_compact 下的章节链接
+            let chapterEls = document.querySelectorAll("div.sr_compact > a[data-chid]")
+            let isCollection = chapterEls.length > 0
+            let chapters = new Map()
+            if (isCollection) {
+                this._appendChapters(chapters, chapterEls)
+
+                // 章节目录分页：页码取所有分页链接中的最大数字（末端还有「後頁」链接）
+                let maxPage = 1
+                let pageLinks = document.querySelectorAll("div.f_left.paginator > a")
+                for (let link of pageLinks) {
+                    let n = parseInt(link.text)
+                    if (!isNaN(n) && n > maxPage) maxPage = n
+                }
+                const MAX_CHAPTER_PAGES = 30
+                let lastPage = Math.min(maxPage, MAX_CHAPTER_PAGES)
+                for (let p = 2; p <= lastPage; p++) {
+                    let r = await Network.get(`${this.baseUrl}/photos-index-aid-${id}-page-${p}.html`, {})
+                    if (r.status !== 200) break
+                    let d = new HtmlDocument(r.body)
+                    this._appendChapters(chapters, d.querySelectorAll("div.sr_compact > a[data-chid]"))
+                    d.dispose()
+                }
+                // 记录第 1 话 id：Venera 预览点击固定进入第 1 话，故预览展示第 1 话内容
+                if (chapters.size > 0) {
+                    this.saveData('wnacgFirstEp_' + id, chapters.keys().next().value)
+                }
+            } else {
+                // 非合集清理可能残留的第 1 话记录
+                this.deleteData('wnacgFirstEp_' + id)
+            }
+
+            let descriptionEl = document.querySelector("div.asTBcell.uwconn > p")
+            let description = descriptionEl ? descriptionEl.text : ''
+            if (isCollection) {
+                // Venera 预览只能展示第 1 话，这里提示用户改用章节按钮
+                let count = labelMap["章節"] || `${chapters.size} 話`
+                let notice = `【合集漫畫，共 ${count}】\n【Venera 預覽僅顯示第 1 話內容，切換章節請用章節按鈕】`
+                description = notice + (description ? `\n\n${description}` : '')
+            }
+            let uploaderEl = document.querySelector("div.asTBcell.uwuinfo > a > p")
+            let uploader = uploaderEl ? uploaderEl.text : ''
+
+            let tags = new Map()
+            if (labelMap["頁數"]) tags.set("頁數", [labelMap["頁數"]])
+            if (labelMap["章節"]) tags.set("章節", [labelMap["章節"]])
+            if (labelMap["狀態"]) tags.set("狀態", [labelMap["狀態"]])
+            if (labelMap["分類"]) tags.set("分類", this._splitValues(labelMap["分類"]))
+            if (rawTags.length > 0) tags.set("標籤", rawTags)
+
+            document.dispose()
+
+            let details = {
                 title: title,
                 cover: cover,
-                pages: pages,
                 tags: tags,
                 description: description,
                 uploader: uploader,
-            })
+            }
+            if (isCollection && chapters.size > 0) {
+                details.chapters = chapters
+            }
+            return new ComicDetails(details)
         },
         /**
          * [Optional] load thumbnails of a comic
@@ -673,23 +779,28 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{thumbnails: string[], next: string?}>} - `next` is next page token, null for no more
          */
         loadThumbnails: async (id, next) => {
-            next = next || '1'
-            let res = await Network.get(`${this.baseUrl}/photos-index-page-${next}-aid-${id}.html`, {});
+            // 合集：预览第 1 话内容（Venera 预览点击固定进入第 1 话，保持操作逻辑一致）
+            let targetId = this.loadData('wnacgFirstEp_' + id) || id
+            let page = next ? (parseInt(next) || 1) : 1
+            let res = await Network.get(`${this.baseUrl}/photos-index-page-${page}-aid-${targetId}.html`, {});
             if (res.status !== 200) {
                 throw `Invalid Status Code ${res.status}`
             }
             let document = new HtmlDocument(res.body)
             let thumbnails = document.querySelectorAll("div.pic_box.tb > a > img").map((e) => {
-                return 'https:' + e.attributes["src"]
+                return this._normalizeCover(e.attributes["src"])
             })
-            next = (Number(next) + 1).toString()
-            let pagesLink = document.querySelector("div.f_left.paginator").children
-            if (pagesLink[pagesLink.length - 1].classNames.includes("thispage")) {
-                next = null
+            // 末页判定：取分页链接中的最大页码
+            let maxPage = page
+            let pageLinks = document.querySelectorAll("div.f_left.paginator > a")
+            for (let link of pageLinks) {
+                let n = parseInt(link.text)
+                if (!isNaN(n) && n > maxPage) maxPage = n
             }
+            document.dispose()
             return {
                 thumbnails: thumbnails,
-                next: next
+                next: page < maxPage ? String(page + 1) : null
             }
         },
         /**
@@ -699,14 +810,16 @@ class Wnacg extends ComicSource {
          * @returns {Promise<{images: string[]}>}
          */
         loadEp: async (comicId, epId) => {
-            let res = await Network.get(`${this.baseUrl}/photos-gallery-aid-${comicId}.html`, {})
+            // 合集某话：epId 为章节 aid；普通相册：epId 为空，读 comicId 自身
+            let targetId = (epId && String(epId) !== '0') ? String(epId) : comicId
+            let res = await Network.get(`${this.baseUrl}/photos-gallery-aid-${targetId}.html`, {})
             if (res.status !== 200) {
                 throw `Invalid Status Code ${res.status}`
             }
             const regex = RegExp(String.raw`//[^"]+/[^"]+\.[^"]+`, 'g');
             const matches = Array.from(res.body.matchAll(regex));
             return {
-                images: matches.map((e) => 'https:' + e[0].substring(0, e[0].length - 1))
+                images: matches.map((e) => this._normalizeCover(e[0].substring(0, e[0].length - 1)))
             }
         },
         /**

@@ -4,7 +4,7 @@ class Lanraragi extends ComicSource {
     key = "lanraragi"
     version = "2.2.1"
     minAppVersion = "1.4.0"
-    url = "https://raw.githubusercontent.com/nimalolikong/ETagCNwithOtherPlugins/master/venera_plugins/lanraragi.js"
+    url = "https://raw.githubusercontent.com/freejhon99/ETagCNwithOtherPlugins/master/venera_plugins/lanraragi.js"
 
     // 最近一次随机入口选中的真实 arcid（用于在详情页标签里加 Random 标记）
     _randomEntryId = null
