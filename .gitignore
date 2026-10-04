@@ -19,4 +19,6 @@ nytprof.out
 *.o
 *.bs
 /_eumm/
+.vscode
+.kilo
 
