@@ -17,6 +17,7 @@
 | --------------------- | -------- | --------------- | ----- | ---------------------------------------------------------------------------------- |
 | `ETagCN.pm`         | metadata | `etagcn`      | 2.6.4 | 搜索 E-Hentai/ExHentai，将标签翻译为中文；支持标签库自动更新、从标题提取作者与标签 |
 | `TitleTagsCN.pm`    | metadata | `titletagscn` | 1.0.0 | 纯离线，从存档标题（文件名）提取作者、艺术家、团队与括号标签，不改动标题           |
+| `ChapterTOC.pm`     | metadata | `chaptertoc`  | 1.0.0 | 纯离线，把存档内的子目录识别为章节，按 LANraragi 排序规则自动生成章节(ToC)          |
 | `PicacgCN.pm`       | metadata | `picacgcn`    | 1.0.0 | 搜索哔咔漫画，反向规范化标签；配合`PicacgLogin.pm` 使用                          |
 | `WnacgCN.pm`        | metadata | `wnacgcn`     | 1.0.1 | 搜索紳士漫畫，反向规范化标签；配合`WnacgLogin.pm` 使用                           |
 | `source/EHentai.pm` | login    | `ehlogin`     | 2.3   | E-Hentai 登录插件（`ETagCN` 的前置登录插件）                                     |
@@ -41,6 +42,16 @@
 
 - 完全离线，仅依据存档标题（文件名）补充标签，不访问网络、不改动标题。
 - 适合批量归档时先做一轮基于文件名的标签补全。
+
+### ChapterTOC
+
+- 完全离线，检测存档（zip/cbz 等）中的**子目录**并将其作为章节写入 LANraragi 的 ToC（章节信息）。
+- 页码严格复用 LANraragi 自身的页面排序（自然排序 + 封面提前 / 版权页后置），因此章节起始页与阅读器完全一致。
+- `auto` 模式会自动选择能分出多章的最浅层级，并去掉公共的包裹目录名（`系列/第1话` → `第1话`）。
+- 默认 `fill` 写入模式：仅当存档尚无章节时才写入，不会覆盖手动设置的 ToC；另有 `merge` / `overwrite` 可选。
+- 兼容 Windows 与 POSIX 路径分隔符，支持中文/日文目录名。
+
+> 说明：LANraragi 目前尚未提供"元数据插件声明章节"的官方返回字段，本插件在 `get_tags` 内直接写入存档的 `toc` 字段；因此即使是手动"使用插件"也会实际写入章节（这正是本插件的目的）。
 
 ## 使用方法（Docker）
 
@@ -72,6 +83,7 @@
 | `debug_picacg.pl`       | 本地验证 PicacgCN / PicacgLogin 的签名与抓取逻辑                                                                                         |
 | `debug_wnacg.pl`        | 本地验证 WnacgCN / WnacgLogin 的抓取逻辑                                                                                                 |
 | `debug_titletags.pl`    | 纯离线验证 TitleTagsCN 的标题标签提取规则                                                                                                |
+| `debug_chaptertoc.pl`   | 纯离线验证 ChapterTOC 的章节识别与页码计算（`--selftest` 自测，或 `--zip` 指定存档）                                                     |
 | `docker_check_wp.pl`    | 在容器内按真实插件逻辑测试紳士漫畫 / 哔咔漫画插件                                                                                        |
 
 示例：
@@ -88,6 +100,7 @@ python tools/run_etagcn_batches.py --base-url http://127.0.0.1:3000 --api-key <y
 .
 ├── ETagCN.pm               # E-Hentai 中文元数据插件（核心）
 ├── TitleTagsCN.pm          # 文件名/标题标签提取插件
+├── ChapterTOC.pm           # 子目录章节(ToC)生成插件
 ├── PicacgCN.pm             # 哔咔漫画元数据插件
 ├── PicacgLogin.pm          # 哔咔漫画登录插件
 ├── WnacgCN.pm              # 紳士漫畫元数据插件
