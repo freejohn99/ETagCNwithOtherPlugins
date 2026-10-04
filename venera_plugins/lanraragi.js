@@ -2,7 +2,7 @@
 class Lanraragi extends ComicSource {
     name = "Lanraragi"
     key = "lanraragi"
-    version = "2.1.0"
+    version = "2.2.0"
     minAppVersion = "1.4.0"
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/lanraragi.js"
 
@@ -25,7 +25,7 @@ class Lanraragi extends ComicSource {
         randomCount: { title: "随机数量", type: "input", default: "30" },
         showRandomEntry: { title: "显示随机入口", type: "switch", default: true },
         syncProgress: { title: "同步阅读进度", type: "switch", default: true },
-        progressOnInfo: { title: "详情页触发进度同步", type: "switch", default: false }
+        progressOnInfo: { title: "详情页触发进度同步（VeneraX 等阅读器需开启）", type: "switch", default: false }
     }
 
     get baseUrl() { 
@@ -730,7 +730,7 @@ class Lanraragi extends ComicSource {
 
     comic = {
         loadInfo: async (id) => {
-            const url = `${this.baseUrl}/api/archives/${id}/metadata`
+            const url = `${this.baseUrl}/api/archives/${id}/metadata?_=${Date.now()}`
             const res = await Network.get(url, this.headers)
             if (res.status !== 200) throw `Invalid status code: ${res.status}`
             const data = JSON.parse(res.body)
@@ -855,7 +855,26 @@ class Lanraragi extends ComicSource {
                     }
                 } catch (_) { /* ignore category detection errors */ }
 
-                const chapters = new Map(); chapters.set(id, data.title || 'Local manga')
+                const chapters = new Map()
+                // 读取服务端章节目录（Table of Contents）：[{ name, page }]，按起始页排序生成章节。
+                // 章节 id 用 "start-end" 编码页范围，end=0 表示到结尾；loadEp 会据此切片。
+                const toc = Array.isArray(data.toc)
+                    ? data.toc.filter(e => e && typeof e.page === 'number' && e.page > 0)
+                    : []
+                if (toc.length > 0) {
+                    toc.sort((a, b) => a.page - b.page)
+                    for (let i = 0; i < toc.length; i++) {
+                        const start = Math.max(1, Math.floor(toc[i].page))
+                        const next = (i + 1 < toc.length) ? Math.max(1, Math.floor(toc[i + 1].page)) : null
+                        const end = next ? Math.max(start, next - 1) : 0
+                        const rawName = (toc[i].name ?? toc[i].title)
+                        const name = (rawName && String(rawName).trim()) ? String(rawName).trim() : `Chapter ${i + 1}`
+                        chapters.set(`${start}-${end}`, name)
+                    }
+                } else {
+                    // 服务端未设置章节目录时，退回“整本一章”，沿用漫画名
+                    chapters.set(id, data.title || 'Local manga')
+                }
                 let stars = this._toStarsFromValue((rating ? rating.replace('rating:', '') : null))
                 // Ensure details page always has a numeric star value (0 if no rating),
                 // otherwise UI may not allow submitting a rating.
@@ -875,7 +894,7 @@ class Lanraragi extends ComicSource {
         loadThumbnails: async (id, next) => {
             // 详情页预览：说明只是浏览详情而非阅读，取消 loadInfo 的兜底上报
             this._cancelProgressOnInfo()
-            const metaUrl = `${this.baseUrl}/api/archives/${id}/metadata`
+            const metaUrl = `${this.baseUrl}/api/archives/${id}/metadata?_=${Date.now()}`
             const res = await Network.get(metaUrl, this.headers)
             if (res.status !== 200) throw `Invalid status code: ${res.status}`
             const data = JSON.parse(res.body)
@@ -892,7 +911,7 @@ class Lanraragi extends ComicSource {
             }
 
             // Fetch current metadata to preserve other tags
-            const metaUrl = `${this.baseUrl}/api/archives/${id}/metadata`
+            const metaUrl = `${this.baseUrl}/api/archives/${id}/metadata?_=${Date.now()}`
             const getRes = await Network.get(metaUrl, hdrs)
             if (getRes.status !== 200) throw `Invalid status code: ${getRes.status}`
             let data = {}
@@ -919,25 +938,34 @@ class Lanraragi extends ComicSource {
         },
         loadEp: async (comicId, epId) => {
             const base = (this.baseUrl || '').replace(/\/$/, '')
-            const url = `${base}/api/archives/${comicId}/files?force=false`
+            const url = `${base}/api/archives/${comicId}/files?force=false&_=${Date.now()}`
             const res = await Network.get(url, this.headers)
             if (res.status !== 200) throw `Invalid status code: ${res.status}`
             const data = JSON.parse(res.body)
-            const images = (data.pages || []).map(p => {
+            const all = (data.pages || []).map(p => {
                 if (!p) return null
                 const s = String(p)
                 if (/^https?:\/\//i.test(s)) return s
                 return `${base}${s.startsWith('/') ? s : '/' + s}`
             }).filter(Boolean)
-            // 记录当前章节的页面顺序，供 onImageLoad 反查页码并上报阅读进度
+            // 章节 id 形如 "start-end"（end=0 表示到结尾）；否则视为整本漫画
+            let startPage = 1
+            let endPage = 0
+            const m = String(epId ?? '').match(/^(\d+)-(\d+)$/)
+            if (m) {
+                startPage = Math.max(1, parseInt(m[1], 10) || 1)
+                endPage = parseInt(m[2], 10) || 0
+            }
+            const images = all.slice(startPage - 1, endPage > 0 ? endPage : undefined)
+            // 记录当前章节的页面顺序，供 onImageLoad 反查页码并上报阅读进度（使用整本的绝对页码）
             this._epComicId = String(comicId ?? '')
             this._pageIndexByUrl = {}
-            images.forEach((u, i) => { if (u) this._pageIndexByUrl[u] = i + 1 })
+            images.forEach((u, i) => { if (u) this._pageIndexByUrl[u] = startPage + i })
             // 打开阅读器即上报一次进度：更新 lastreadtime，让「最近阅读」立刻能列出该漫画。
-            // 页码用已知进度（无则 1），保证不因缓存命中（onImageLoad 被跳过）而完全不上报。
+            // 页码用已知进度（无则本章起始页），保证不因缓存命中（onImageLoad 被跳过）而完全不上报。
             if (this._syncProgressEnabled() && this._serverTracksProgress()) {
                 const known = this._archiveProgress[String(comicId)] || 0
-                this._sendProgress(String(comicId), known > 0 ? known : 1)
+                this._sendProgress(String(comicId), known > 0 ? known : startPage)
             }
             return { images }
         },
@@ -1018,7 +1046,7 @@ class Lanraragi extends ComicSource {
             "随机数量": "随机数量",
             "显示随机入口": "显示随机入口",
             "同步阅读进度": "同步阅读进度",
-            "详情页触发进度同步": "详情页触发进度同步",
+            "详情页触发进度同步（VeneraX 等阅读器需开启）": "详情页触发进度同步（VeneraX 等阅读器需开启）",
             "最近阅读": "最近阅读",
             "随机": "随机",
             "内置": "内置",
@@ -1055,7 +1083,7 @@ class Lanraragi extends ComicSource {
             "随机数量": "Random count",
             "显示随机入口": "Show random entry",
             "同步阅读进度": "Sync read progress",
-            "详情页触发进度同步": "Sync progress on info",
+            "详情页触发进度同步（VeneraX 等阅读器需开启）": "Sync progress on info (enable for VeneraX-like readers)",
             "最近阅读": "Recently read",
             "随机": "Random",
             "内置": "Built-in",
