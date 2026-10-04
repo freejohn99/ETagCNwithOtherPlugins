@@ -5,5 +5,12 @@
         "key": "lanraragi",
         "version": "2.2.1",
         "description": "LANraragi 漫画源（服务端章节 ToC、阅读进度同步、随机入口等增强）"
+    },
+    {
+        "name": "紳士漫畫",
+        "fileName": "wnacg.js",
+        "key": "wnacg",
+        "version": "1.1.0",
+        "description": "紳士漫畫漫畫源, 支持合集, 不能使用時請嘗試更換URL"
     }
 ]
