@@ -2,18 +2,30 @@
 class Lanraragi extends ComicSource {
     name = "Lanraragi"
     key = "lanraragi"
-    version = "2.0.0"
+    version = "2.1.0"
     minAppVersion = "1.4.0"
     url = "https://cdn.jsdelivr.net/gh/venera-app/venera-configs@main/lanraragi.js"
 
     // 最近一次随机入口选中的真实 arcid（用于在详情页标签里加 Random 标记）
     _randomEntryId = null
 
+    // 阅读进度上报相关状态
+    _epComicId = ''
+    _pageIndexByUrl = null
+    _archiveProgress = {}
+    _lastProgressKey = ''
+    _lastProgressAt = 0
+    _pendingProgress = null
+    _progressTimer = null
+    _infoReportId = ''
+
     settings = {
         api: { title: "API", type: "input", default: "http://lrr.tvc-16.science" },
         apiKey: { title: "APIKEY", type: "input", default: "" },
         randomCount: { title: "随机数量", type: "input", default: "30" },
-        showRandomEntry: { title: "显示随机入口", type: "switch", default: true }
+        showRandomEntry: { title: "显示随机入口", type: "switch", default: true },
+        syncProgress: { title: "同步阅读进度", type: "switch", default: true },
+        progressOnInfo: { title: "详情页触发进度同步", type: "switch", default: false }
     }
 
     get baseUrl() { 
@@ -164,6 +176,89 @@ class Lanraragi extends ComicSource {
         return Array.isArray(data.data) ? data.data : []
     }
 
+    _syncProgressEnabled() {
+        return this.loadSetting('syncProgress') !== false
+    }
+
+    _serverTracksProgress() {
+        // fail-open：只有明确拿到 server_tracks_progress=false 才不上报，
+        // 避免 /api/info 查询失败时（旧版本/网络问题）整个同步失效。
+        return this.loadData('server_tracks_progress') !== false
+    }
+
+    // 阅读进度上报（best-effort）。
+    // Venera 没有专门的阅读进度回调，这里用两处近似上报：
+    // 1) loadEp（打开阅读器）时按已知进度上报一次，保证 lastreadtime 更新，「最近阅读」能列出；
+    // 2) onImageLoad（页面图片实际下载，缓存命中的图片不会触发）时，用 loadEp 记录的
+    //    「图片 URL -> 第几页」映射反查页码并上报，用于推进具体页码。
+    // 上报做了节流（约 2s 一次）+ 尾随补偿：节流期内翻页会在窗口结束后补报最新页。
+    _maybeReportProgress(url, comicId) {
+        if (!this._syncProgressEnabled() || !this._serverTracksProgress()) return
+        const map = this._pageIndexByUrl
+        if (!map) return
+        const page = map[url]
+        if (!page) return
+        const id = String(comicId ?? this._epComicId ?? '')
+        if (!id || String(this._epComicId) !== id) return
+        const key = id + ':' + page
+        if (this._lastProgressKey === key) return
+        const now = Date.now()
+        const elapsed = now - (this._lastProgressAt || 0)
+        if (elapsed >= 2000) {
+            this._lastProgressKey = key
+            this._lastProgressAt = now
+            this._sendProgress(id, page)
+            return
+        }
+        // 节流窗口内：记住最新页，窗口结束后补报
+        this._pendingProgress = { id: id, page: page }
+        if (!this._progressTimer) {
+            this._progressTimer = setTimeout(() => {
+                this._progressTimer = null
+                const p = this._pendingProgress
+                this._pendingProgress = null
+                if (!p) return
+                this._lastProgressKey = p.id + ':' + p.page
+                this._lastProgressAt = Date.now()
+                this._sendProgress(p.id, p.page)
+            }, 2000 - elapsed)
+        }
+    }
+
+    _sendProgress(id, page) {
+        try {
+            const base = (this.baseUrl || '').replace(/\/$/, '')
+            const url = `${base}/api/archives/${id}/progress/${page}`
+            Network.put(url, this.headers, '')
+                .then(r => { try { console.log(`[Lanraragi] progress ${id} -> ${page} : ${r && r.status}`) } catch (_) {} })
+                .catch(e => { try { console.log(`[Lanraragi] progress ${id} -> ${page} failed: ${e}`) } catch (_) {} })
+        } catch (_) {}
+    }
+
+    // 兜底上报：某些客户端（如 VeneraX）重写了阅读器/状态层，打开阅读器时
+    // 可能不经过 comic.loadEp，导致上面的进度上报完全不触发。
+    // 这个开关（默认关）会在 loadInfo 打开详情/阅读器后延迟约 2s 上报一次；
+    // 若随后调用了 loadThumbnails（详情页预览）或 favorites.loadFolders（收藏夹），
+    // 则视为并非阅读行为而取消。这样既能兼容 VeneraX，又避免浏览详情页误标为已读。
+    _scheduleProgressOnInfo(id) {
+        if (this.loadSetting('progressOnInfo') !== true) return
+        const token = String(id ?? '')
+        if (!token) return
+        this._infoReportId = token
+        setTimeout(() => {
+            if (this._infoReportId !== token) return
+            this._infoReportId = ''
+            if (this.loadSetting('progressOnInfo') !== true) return
+            if (!this._syncProgressEnabled() || !this._serverTracksProgress()) return
+            const known = this._archiveProgress[token] || 0
+            this._sendProgress(token, known > 0 ? known : 1)
+        }, 2000)
+    }
+
+    _cancelProgressOnInfo() {
+        this._infoReportId = ''
+    }
+
     // Parse various rating string/number formats and convert to 0-5 scale with 0.5 step
     _toStarsFromValue(v) {
         if (v === null || v === undefined) return null
@@ -285,6 +380,18 @@ class Lanraragi extends ComicSource {
                 this.saveData('favorites', [])
             }
         } catch (_) { this.saveData('categories', []) }
+
+        // 查询服务端是否开启「阅读进度追踪」，供进度上报判断（/api/info）
+        if (this._syncProgressEnabled()) {
+            try {
+                const infoRes = await Network.get(`${this.baseUrl}/api/info`, this.headers)
+                if (infoRes.status === 200) {
+                    let info = {}
+                    try { info = JSON.parse(infoRes.body) } catch (_) { info = {} }
+                    this.saveData('server_tracks_progress', info.server_tracks_progress === true)
+                }
+            } catch (_) {}
+        }
     }
 
     explore = [
@@ -297,6 +404,9 @@ class Lanraragi extends ComicSource {
             add('sortby', 'date_added')
             add('order', 'desc')
             add('start', String(start))
+            // 时间戳做缓存穿透：Venera 的 NetworkCacheManager 会缓存相同 GET URL 的响应，
+            // 否则「最近阅读」等列表会命中旧缓存、要刷新多次才更新。
+            add('_', String(Date.now()))
 
             const url = `${base}/api/search?${qp.join('&')}`
             const res = await Network.get(url, this.headers)
@@ -346,6 +456,7 @@ class Lanraragi extends ComicSource {
                     catch (_) { return { label: label, target: { page: 'search', attributes: attributes } } }
                 }
                 return [
+                    make('最近阅读', ['lastread', 'asc', 'false', 'false', 'true']),
                     make('全部漫画', ['date_added', 'desc', 'false', 'false', 'true']),
                     make('新档案', ['date_added', 'desc', 'true', 'false', 'true']),
                     make('无标签档案', ['date_added', 'desc', 'false', 'true', 'true']),
@@ -382,6 +493,9 @@ class Lanraragi extends ComicSource {
             add('sortby', 'date_added')
             add('order', 'desc')
             add('start', String(start))
+            // 时间戳做缓存穿透：Venera 的 NetworkCacheManager 会缓存相同 GET URL 的响应，
+            // 否则「最近阅读」等列表会命中旧缓存、要刷新多次才更新。
+            add('_', String(Date.now()))
 
             const url = `${base}/api/search?${qp.join('&')}`
             const res = await Network.get(url, this.headers)
@@ -480,6 +594,9 @@ class Lanraragi extends ComicSource {
                 start = Number(this.loadData(searchKey) || 0)
             }
             add('start', String(start))
+            // 时间戳做缓存穿透：Venera 的 NetworkCacheManager 会缓存相同 GET URL 的响应，
+            // 否则「最近阅读」等列表会命中旧缓存、要刷新多次才更新。
+            add('_', String(Date.now()))
 
             const url = `${base}/api/search?${qp.join('&')}`
             const res = await Network.get(url, this.headers)
@@ -560,6 +677,8 @@ class Lanraragi extends ComicSource {
             if (comicId) {
                 try {
                     const info = await this.comic.loadInfo(comicId)
+                    // 收藏夹里读取信息不算阅读，取消 loadInfo 的兜底上报
+                    this._cancelProgressOnInfo()
 
                     try {
                         if (info && (info.isFavorite === true || info.isFavorite === 'true')) {
@@ -615,6 +734,10 @@ class Lanraragi extends ComicSource {
             const res = await Network.get(url, this.headers)
             if (res.status !== 200) throw `Invalid status code: ${res.status}`
             const data = JSON.parse(res.body)
+            // 记录服务端已知的阅读进度，供打开阅读器（loadEp）时刷新 lastreadtime 用
+            this._archiveProgress[String(id)] = (typeof data.progress === 'number' && data.progress > 0) ? data.progress : 0
+            // 可选的兜底上报（见 _scheduleProgressOnInfo）
+            this._scheduleProgressOnInfo(id)
             const cover = `${this.baseUrl}/api/archives/${id}/thumbnail`
                 let flatTags = data.tags ? data.tags.split(',').map(t=>t.trim()).filter(Boolean) : []
                 const rating = flatTags.find(t=>t.startsWith('rating:'))
@@ -750,6 +873,8 @@ class Lanraragi extends ComicSource {
                 }
         },
         loadThumbnails: async (id, next) => {
+            // 详情页预览：说明只是浏览详情而非阅读，取消 loadInfo 的兜底上报
+            this._cancelProgressOnInfo()
             const metaUrl = `${this.baseUrl}/api/archives/${id}/metadata`
             const res = await Network.get(metaUrl, this.headers)
             if (res.status !== 200) throw `Invalid status code: ${res.status}`
@@ -804,9 +929,20 @@ class Lanraragi extends ComicSource {
                 if (/^https?:\/\//i.test(s)) return s
                 return `${base}${s.startsWith('/') ? s : '/' + s}`
             }).filter(Boolean)
+            // 记录当前章节的页面顺序，供 onImageLoad 反查页码并上报阅读进度
+            this._epComicId = String(comicId ?? '')
+            this._pageIndexByUrl = {}
+            images.forEach((u, i) => { if (u) this._pageIndexByUrl[u] = i + 1 })
+            // 打开阅读器即上报一次进度：更新 lastreadtime，让「最近阅读」立刻能列出该漫画。
+            // 页码用已知进度（无则 1），保证不因缓存命中（onImageLoad 被跳过）而完全不上报。
+            if (this._syncProgressEnabled() && this._serverTracksProgress()) {
+                const known = this._archiveProgress[String(comicId)] || 0
+                this._sendProgress(String(comicId), known > 0 ? known : 1)
+            }
             return { images }
         },
         onImageLoad: (url, comicId, epId) => {
+            try { this._maybeReportProgress(url, comicId) } catch (_) {}
             return {
                 headers: this.headers
             }
@@ -881,6 +1017,9 @@ class Lanraragi extends ComicSource {
             "Extension": "文件类型",
             "随机数量": "随机数量",
             "显示随机入口": "显示随机入口",
+            "同步阅读进度": "同步阅读进度",
+            "详情页触发进度同步": "详情页触发进度同步",
+            "最近阅读": "最近阅读",
             "随机": "随机",
             "内置": "内置",
             "分类": "分类",
@@ -915,6 +1054,9 @@ class Lanraragi extends ComicSource {
             "Extension": "Extension",
             "随机数量": "Random count",
             "显示随机入口": "Show random entry",
+            "同步阅读进度": "Sync read progress",
+            "详情页触发进度同步": "Sync progress on info",
+            "最近阅读": "Recently read",
             "随机": "Random",
             "内置": "Built-in",
             "分类": "Categories",
