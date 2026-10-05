@@ -7,12 +7,12 @@ class Wnacg extends ComicSource {
     // unique id of the source
     key = "wnacg"
 
-    version = "1.1.1"
+    version = "1.1.2"
 
     minAppVersion = "1.0.0"
 
     // update url
-    url = "https://raw.githubusercontent.com/freejhon99/ETagCNwithOtherPlugins/master/venera_plugins/wnacg.js"
+    url = "https://raw.githubusercontent.com/freejohn99/ETagCNwithOtherPlugins/master/venera_plugins/wnacg.js"
 
     static domains = [];
 
@@ -190,8 +190,9 @@ class Wnacg extends ComicSource {
         return out
     }
 
-    // 追加合集章节：chapters 的 key=章节名（决定下载文件夹与显示），chapterMap 记录 名称 -> 章节 aid
-    _appendChapters(chapters, chapterMap, elements) {
+    // 解析章节链接为 [{aid, name}]，需在 document.dispose() 之前调用
+    _parseChapterEntries(elements) {
+        let entries = []
         for (let a of elements) {
             let attrs = a.attributes || {}
             let chid = attrs["data-chid"]
@@ -200,13 +201,23 @@ class Wnacg extends ComicSource {
                 if (m) chid = m[0]
             }
             if (!chid) continue
+            let name = (a.text || '').replace(/\s+/g, ' ').trim()
+            entries.push({ aid: chid, name: name })
+        }
+        return entries
+    }
+
+    // 追加合集章节：chapters 的 key=章节名（决定下载文件夹与显示），chapterMap 记录 名称 -> 章节 aid
+    _appendChapters(chapters, chapterMap, entries) {
+        for (let entry of entries) {
+            let chid = entry.aid
             // 按章节 aid 去重
             let exists = false
             for (let k in chapterMap) {
                 if (chapterMap[k] === chid) { exists = true; break }
             }
             if (exists) continue
-            let name = (a.text || '').replace(/\s+/g, ' ').trim() || `第${chapters.size + 1}話`
+            let name = entry.name || `第${chapters.size + 1}話`
             let unique = name
             let suffix = 2
             while (chapters.has(unique)) {
@@ -215,6 +226,65 @@ class Wnacg extends ComicSource {
             chapters.set(unique, unique)
             chapterMap[unique] = chid
         }
+    }
+
+    // 抓取单页章节目录；失败/异常/无章节返回 null（由调用方视作失败并重试）
+    async _fetchChapterPage(id, p) {
+        try {
+            let r = await Network.get(`${this.baseUrl}/photos-index-aid-${id}-page-${p}.html`, {})
+            if (r.status !== 200) return null
+            let d = new HtmlDocument(r.body)
+            let entries = this._parseChapterEntries(d.querySelectorAll("div.sr_compact > a[data-chid]"))
+            d.dispose()
+            // 目录页 2..N 必然含章节；0 条通常是 Cloudflare 挑战页/半渲染，视为失败以触发重试
+            if (entries.length === 0) return null
+            return entries
+        } catch (e) {
+            return null
+        }
+    }
+
+    // 限并发抓取指定页码的章节目录，返回与 pageNumbers 同序的 entries 数组
+    // 并发过高会被站点/Cloudflare 拒绝（实测 5 并发会失败），失败页再顺序重试
+    async _fetchChapterPages(id, pageNumbers, limit) {
+        let results = new Array(pageNumbers.length)
+        let cursor = 0
+        let worker = async () => {
+            while (cursor < pageNumbers.length) {
+                let i = cursor++
+                results[i] = await this._fetchChapterPage(id, pageNumbers[i])
+            }
+        }
+        let workers = []
+        let workerCount = Math.min(limit, pageNumbers.length)
+        for (let k = 0; k < workerCount; k++) {
+            workers.push(worker())
+        }
+        for (let w of workers) {
+            await w
+        }
+        // 顺序重试失败页，避免因并发压力丢章节
+        let failed = []
+        for (let i = 0; i < results.length; i++) {
+            if (!results[i]) failed.push(i)
+        }
+        const ATTEMPT_RETRY_MAX = 2 // 重试两次，避免因网络波动失败
+        for (let attempt = 0; attempt < ATTEMPT_RETRY_MAX && failed.length > 0; attempt++) {
+            let still = []
+            for (let i of failed) {
+                let entries = await this._fetchChapterPage(id, pageNumbers[i])
+                if (entries) {
+                    results[i] = entries
+                } else {
+                    still.push(i)
+                }
+            }
+            failed = still
+        }
+        for (let i of failed) {
+            results[i] = []
+        }
+        return results
     }
 
     // 抓取合集完整章节目录，返回 { chapters(名->名), chapterMap(名->aid) }
@@ -229,7 +299,7 @@ class Wnacg extends ComicSource {
             }
             doc = new HtmlDocument(res.body)
         }
-        this._appendChapters(chapters, chapterMap, doc.querySelectorAll("div.sr_compact > a[data-chid]"))
+        this._appendChapters(chapters, chapterMap, this._parseChapterEntries(doc.querySelectorAll("div.sr_compact > a[data-chid]")))
         // 章节目录分页：页码取所有分页链接中的最大数字（末端还有「後頁」链接）
         let maxPage = 1
         let pageLinks = doc.querySelectorAll("div.f_left.paginator > a")
@@ -238,14 +308,20 @@ class Wnacg extends ComicSource {
             if (!isNaN(n) && n > maxPage) maxPage = n
         }
         if (!firstDocument) doc.dispose()
-        const MAX_CHAPTER_PAGES = 30
+        // 按分页器真实页数抓取；200 页仅作异常保护（约 2400 话）
+        // 并发 3：实测 5 并发会被站点拒绝，3 并发稳定；失败页由 _fetchChapterPages 顺序重试
+        const MAX_CHAPTER_PAGES = 200
+        const CONCURRENCY = 3
         let lastPage = Math.min(maxPage, MAX_CHAPTER_PAGES)
-        for (let p = 2; p <= lastPage; p++) {
-            let r = await Network.get(`${this.baseUrl}/photos-index-aid-${id}-page-${p}.html`, {})
-            if (r.status !== 200) break
-            let d = new HtmlDocument(r.body)
-            this._appendChapters(chapters, chapterMap, d.querySelectorAll("div.sr_compact > a[data-chid]"))
-            d.dispose()
+        if (lastPage >= 2) {
+            let pageNumbers = []
+            for (let p = 2; p <= lastPage; p++) {
+                pageNumbers.push(p)
+            }
+            let results = await this._fetchChapterPages(id, pageNumbers, CONCURRENCY)
+            for (let entries of results) {
+                this._appendChapters(chapters, chapterMap, entries || [])
+            }
         }
         return { chapters: chapters, chapterMap: chapterMap }
     }
