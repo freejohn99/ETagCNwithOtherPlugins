@@ -14,6 +14,7 @@ use URI::Escape;
 use Mojo::JSON qw(decode_json encode_json);
 use Mojo::Util qw(html_unescape trim);
 use Mojo::UserAgent;
+use Mojo::Cookie::Response;
 use Digest::MD5;
 use Digest::SHA;
 
@@ -31,7 +32,7 @@ sub plugin_info {
         namespace   => "etagcn",
         login_from  => "ehlogin",
         author      => "FreeJohn&DeepSeek",
-        version     => "2.6.4",
+        version     => "2.6.5",
         description =>
           "搜索 g.e-hentai 以查找与您的存档匹配的标签,并将原标签翻译为中文标签. <br/><i class='fa fa-exclamation-circle'></i> 此插件将使用存档的 source: tag （如果存在）",
         icon =>
@@ -52,6 +53,7 @@ sub plugin_info {
             { type => "int",  desc => "标签数据库更新检查间隔（天），默认 1；填 0 表示每次都检查" },
             { type => "bool", desc => "从文件名/标题提取作者、艺术家、团队（含 [团体 (艺术家)]，以及标题最前方无圆括号的方括号；宁滥勿缺）" },
             { type => "bool", desc => "提取文件名/标题中所有括号内容为标签（明显的语言/汉化组会额外加入 语言:/汉化组: 命名空间）" },
+            { type => "string", desc => "sk cookie（可选）：搜索刚发布的新画廊时需要；从浏览器复制 sk 的值填这里" },
         ],
         oneshot_arg => "该漫画在e-hentai的URL(将于确切的漫画相匹配的标签到你的档案中)",
         cooldown    => 4
@@ -68,7 +70,7 @@ sub get_tags {
     my $lrr_info = shift;                                                                               # Global info hash
     my $ua       = $lrr_info->{user_agent};
     my ( $lang, $savetitle, $usethumbs, $search_gid, $enablepanda, $jpntitle, $additionaltags, $expunged, $db_path,
-        $autoupdate_db, $db_update_days, $extract_authors, $extract_all_brackets ) = @_;    # Plugin parameters
+        $autoupdate_db, $db_update_days, $extract_authors, $extract_all_brackets, $sk_cookie ) = @_;    # Plugin parameters
 
     $db_update_days = 1 if !defined $db_update_days || $db_update_days !~ /^\d+$/;
     $extract_authors = 1 if !defined $extract_authors;    # 默认开启：文件名/标题里的作者名
@@ -76,6 +78,17 @@ sub get_tags {
 
     # Use the logger to output status - they'll be passed to a specialized logfile and written to STDOUT.
     my $logger = get_plugin_logger();
+
+    # EH 的搜索会隐藏“刚发布”的新画廊，除非会话带 sk cookie（sk 只在访问画廊页时下发）。
+    # 若配置了 sk，就注入到 UA，让 gid / 标题搜索也能命中新画廊。
+    if ( defined $sk_cookie && $sk_cookie ne '' ) {
+        for my $domain ( 'e-hentai.org', 'exhentai.org' ) {
+            $ua->cookie_jar->add(
+                Mojo::Cookie::Response->new( name => 'sk', value => $sk_cookie, domain => $domain, path => '/' )
+            );
+        }
+        $logger->info("Injected sk cookie for e-/exhentai search");
+    }
 
     # Work your magic here - You can create subroutines below to organize the code better
     my $gID    = "";
@@ -93,6 +106,12 @@ sub get_tags {
         $gToken = $2;
         $hasSrc = 1;
         $logger->debug("Skipping search and using gallery $gID / $gToken from source tag");
+    } elsif ( $lrr_info->{archive_title} =~ m{(?:https?://)?e(?:x|-)hentai\.org/g/(\d+)/([0-9a-z]+)|/g/(\d+)/([0-9a-z]+)}i ) {
+
+        # 文件名里直接带 EH 画廊 URL 或 /g/<gid>/<token>/ 时，跳过搜索直接用
+        $gID    = ( $1 // $3 );
+        $gToken = ( $2 // $4 );
+        $logger->info("Using gallery $gID / $gToken parsed from archive title");
     } else {
 
         # Craft URL for Text Search on EH if there's no user argument
@@ -309,14 +328,19 @@ sub lookup_gallery ( $title, $tags, $thumbhash, $ua, $domain, $defaultlanguage, 
         $logger->info("gID search is enabled but no gID could be parsed from title: '$title'");
     }
     if ( $search_gid && $title_gid ) {
-        $URL = $domain . "?f_search=" . uri_escape_utf8("gid:$title_gid");
+        # 先普通 gid 搜索；未命中再带上 f_sh=on 试试（可能命中的是已删除/隐藏的画廊）
+        my $base_q  = uri_escape_utf8("gid:$title_gid");
+        my @suffix  = ( $expunged ? ('&f_sh=on') : ( '', '&f_sh=on' ) );
 
-        $logger->info("gID search: gid=$title_gid, URL=$URL");
+        for my $suffix (@suffix) {
+            $URL = $domain . "?f_search=" . $base_q . $suffix;
+            $logger->info("gID search: gid=$title_gid, URL=$URL");
 
-        my ( $gId, $gToken ) = &ehentai_parse( $URL, $ua );
+            my ( $gId, $gToken ) = &ehentai_parse( $URL, $ua );
 
-        if ( $gId ne "" && $gToken ne "" ) {
-            return ( $gId, $gToken );
+            if ( $gId ne "" && $gToken ne "" ) {
+                return ( $gId, $gToken );
+            }
         }
         $logger->info("gID search (gid=$title_gid) returned no match, falling back to title search");
     }
